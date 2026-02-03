@@ -1,0 +1,150 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\geometry{margin=1in}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false
+}
+
+\title{Fig.~1 Options (a,b,c) + Option (d): Local Vector Prediction Errors}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Goal}
+Summarize the three conceptual alternatives in Fig.~1 (a,b,c) of \emph{Lee et al.} (Nature Neuroscience 2024, \href{https://doi.org/10.1038/s41593-024-01689-1}{doi:10.1038/s41593-024-01689-1}) and add a fourth option (d) that modifies learning so that \emph{each feature-specific prediction error is used locally} to drive plasticity on its corresponding features.
+
+\section*{Shared notation}
+At time $t$: state $s_t$, next state $s_{t+1}$, reward $r_t$, discount $\gamma\in[0,1)$, terminal indicator $d_t\in\{0,1\}$.
+
+We focus on state-value TD for clarity. (A Q-learning/DQN analogue replaces $V(s_{t+1})$ with $\max_{a'}Q(s_{t+1},a')$ and $V(s_t)$ with $Q(s_t,a_t)$.)
+
+Define the standard (scalar) TD error:
+\begin{equation}
+\delta_t \;=\; r_t + \gamma(1-d_t) V(s_{t+1}) - V(s_t).
+\end{equation}
+
+\section*{Option (a): Classic scalar RPE / TD learning}
+\paragraph{Core idea.}
+One scalar value $V(s)$ and one scalar prediction error $\delta$ broadcast everywhere.
+
+\paragraph{Update (generic).}
+For a differentiable parametric value $V_\theta$:
+\begin{equation}
+\theta \leftarrow \theta - \alpha \nabla_\theta \tfrac{1}{2}\delta_t^2.
+\end{equation}
+For a linear function approximator $V(s)=w^\top \phi(s)$:
+\begin{equation}
+w \leftarrow w + \alpha\,\delta_t\,\phi(s_t).
+\end{equation}
+
+\paragraph{Code sketch.}
+In deep RL, this corresponds to computing a scalar TD target and minimizing MSE between target and prediction (e.g., DQN/A2C value loss).
+
+\section*{Option (b): Outcome-specific prediction errors (``multiple targets'')}
+\paragraph{Core idea.}
+Run multiple TD learners in parallel, each with a different \emph{target outcome} $o_t^{(k)}$ (not necessarily reward). Each produces its own PE:
+\begin{equation}
+\delta_t^{(k)} \;=\; o_t^{(k)} + \gamma(1-d_t) V^{(k)}(s_{t+1}) - V^{(k)}(s_t), \qquad k=1,\dots,K.
+\end{equation}
+Examples include distributional RL (quantile/categorical outcomes), action prediction errors, successor-feature errors, etc.
+
+\paragraph{Update.}
+\begin{equation}
+\theta_k \leftarrow \theta_k - \alpha \nabla_{\theta_k} \tfrac{1}{2}\left(\delta_t^{(k)}\right)^2.
+\end{equation}
+
+\paragraph{Code sketch.}
+This corresponds to training multiple heads (or multiple networks) with distinct targets $o^{(k)}$, each with its own scalar TD loss.
+
+\section*{Option (c): Feature-specific prediction errors (``state-feature decomposition'')}
+\paragraph{Core idea.}
+The outcome remains reward, but the \emph{state representation} is distributed. Different units compute error-like signals tied to different state features.
+
+One convenient formalization is a feature-based value decomposition:
+\begin{equation}
+V(s) \;=\; \sum_{i=1}^{K} v_i(s),\qquad v_i(s)=w_i\,\phi_i(s).
+\end{equation}
+Then the scalar TD error can be decomposed into feature contributions:
+\begin{align}
+\delta_t
+&= r_t + \gamma(1-d_t)\sum_{i} w_i\phi_i(s_{t+1}) - \sum_{i} w_i\phi_i(s_t) \\
+&= r_t + \sum_{i=1}^{K} w_i\Big(\gamma(1-d_t)\phi_i(s_{t+1})-\phi_i(s_t)\Big).
+\end{align}
+To make this a true sum of per-feature signals, split reward into components $r_t^{(i)}$ such that:
+\begin{equation}
+\sum_{i=1}^{K} r_t^{(i)} = r_t.
+\end{equation}
+Then define per-feature PEs:
+\begin{equation}
+\delta_{t}^{(i)} \;=\; r_t^{(i)} + w_i\Big(\gamma(1-d_t)\phi_i(s_{t+1})-\phi_i(s_t)\Big),
+\end{equation}
+which satisfy:
+\begin{equation}
+\sum_{i=1}^{K}\delta_t^{(i)} = \delta_t.
+\end{equation}
+
+\paragraph{Important distinction.}
+Option (c) \emph{can} still update weights with the reconstructed scalar $\delta_t$ (global update), while \emph{interpreting} $\delta_t^{(i)}$ as heterogeneous DA-like signals. This is what the simple reference implementation in \texttt{vectorRL/APE analysis/VectorRPEAgent.py} currently does.
+
+\paragraph{Existing code (global update; feature-specific signals are output/recorded).}
+\begin{lstlisting}
+delta_feat = self.compute_delta_feat(state_vec, succ_vec, reward)
+delta = np.sum(delta_feat)
+self.weights += self.alpha * delta * state_vec
+\end{lstlisting}
+
+\section*{Option (d): Local vector-PE learning (use each feature-specific error locally)}
+\paragraph{Core idea.}
+Keep the same feature-specific errors $\delta_t^{(i)}$ as in (c), but change the learning rule so that each $\delta_t^{(i)}$ drives plasticity only on its corresponding feature pathway.
+
+\paragraph{Local update rule (no eligibility traces).}
+\begin{equation}
+w_i \leftarrow w_i + \alpha\,\delta_t^{(i)}\,\phi_i(s_t).
+\end{equation}
+Vector form:
+\begin{equation}
+w \leftarrow w + \alpha\,\delta_t^{\text{vec}} \odot \phi(s_t),
+\end{equation}
+where $\delta_t^{\text{vec}} = (\delta_t^{(1)},\dots,\delta_t^{(K)})$ and $\odot$ is elementwise product.
+
+\paragraph{Local update rule (with eligibility traces).}
+Define a per-feature eligibility:
+\begin{equation}
+e_i \leftarrow \gamma\lambda e_i + \phi_i(s_t),
+\end{equation}
+then:
+\begin{equation}
+w_i \leftarrow w_i + \alpha\,\delta_t^{(i)}\,e_i.
+\end{equation}
+
+\paragraph{What this buys you (neuroscience mapping).}
+Each channel $i$ can be interpreted as a DA neuron/axon population broadcasting $\delta^{(i)}$ to synapses that carry feature $\phi_i$, implementing a three-factor rule (pre-synaptic feature activity $\times$ local eligibility/post \ $\times$ modulatory error).
+
+\paragraph{Code update snippet (minimal change in \texttt{VectorRPEAgent.learn}).}
+Replace the global update with an elementwise local update:
+\begin{lstlisting}
+delta_feat = self.compute_delta_feat(state_vec, succ_vec, reward)
+
+# OLD (global scalar TD error):
+# delta = np.sum(delta_feat)
+# self.weights += self.alpha * delta * state_vec
+
+# NEW (local vector-PE learning):
+self.weights += self.alpha * delta_feat * state_vec  # elementwise
+\end{lstlisting}
+
+\paragraph{Note on reward splitting.}
+If you use the uniform split $r_t^{(i)}=r_t/K$, then $\sum_i \delta_t^{(i)}=\delta_t$ holds. More generally one may use $r_t^{(i)}=\alpha_i(s_t)\,r_t$ with $\alpha_i(s_t)\ge 0, \sum_i\alpha_i(s_t)=1$.
+
+\end{document}
