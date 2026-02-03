@@ -1,0 +1,47 @@
+# Ignore everything except code/, context/, paper/, and environment.yml
+*
+
+# But don't ignore these specific files/folders
+!.gitignore
+!code/
+!context/
+!paper/
+!environment.yml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+## Environments
+.venv/
+venv/
+ENV/
+.env
+.env.*
+
+## Jupyter
+.ipynb_checkpoints/
+
+## Logs / outputs
+*.log
+runs/
+wandb/
+tb_logs/
+
+## OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cursor/
+
+## Build artifacts
+build/
+dist/
+*.egg-info/
