@@ -6,6 +6,8 @@
 !code/
 !context/
 !paper/
+!paper/**
+!*.tex
 !environment.yml
 !2layers_dqns/
 !2layers_dqns/**

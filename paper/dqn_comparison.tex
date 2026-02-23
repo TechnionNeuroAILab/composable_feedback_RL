@@ -1,0 +1,384 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Comparison of Two-Layer DQN Architectures:\\
+Linear, Linear with Clipping, ReLU, and LeakyReLU}
+\author{Technion NeuroAI Lab}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+This document provides a comprehensive comparison of four Deep Q-Network (DQN) architectures trained on the CartPole-v1 environment. All networks share a two-layer architecture but differ in their activation functions and training stability mechanisms. The four variants are:
+
+\begin{enumerate}
+    \item \textbf{Linear}: Fully linear network with no activation functions
+    \item \textbf{Linear with Clipping}: Linear network with gradient clipping and target Q-value clipping
+    \item \textbf{ReLU}: Network with Rectified Linear Unit activation
+    \item \textbf{LeakyReLU}: Network with Leaky Rectified Linear Unit activation
+\end{enumerate}
+
+\section{Network Architecture}
+
+All four networks share the same basic two-layer architecture:
+
+\begin{equation}
+Q(s, a; \theta) = W_2 \cdot h(s; W_1) + b_2
+\end{equation}
+
+where $s \in \mathbb{R}^4$ is the state vector (CartPole observations), $a \in \{0, 1\}$ is the action, and $\theta = \{W_1, b_1, W_2, b_2\}$ are the network parameters.
+
+The hidden layer computation differs based on the activation function:
+
+\begin{equation}
+h(s; W_1) = \sigma(W_1 \cdot s + b_1)
+\end{equation}
+
+where $\sigma(\cdot)$ is the activation function, which varies across architectures.
+
+\subsection{Linear Network}
+
+For the linear network, $\sigma$ is the identity function:
+
+\begin{equation}
+\sigma_{\text{linear}}(z) = z
+\end{equation}
+
+Therefore, the forward pass simplifies to:
+
+\begin{equation}
+Q(s, a; \theta) = W_2 \cdot (W_1 \cdot s + b_1) + b_2 = W_2 W_1 \cdot s + W_2 b_1 + b_2
+\end{equation}
+
+This can be rewritten as a single linear transformation:
+
+\begin{equation}
+Q(s, a; \theta) = W_{\text{eff}} \cdot s + b_{\text{eff}}
+\end{equation}
+
+where $W_{\text{eff}} = W_2 W_1$ and $b_{\text{eff}} = W_2 b_1 + b_2$.
+
+\subsection{ReLU Network}
+
+For the ReLU network, the activation function is:
+
+\begin{equation}
+\sigma_{\text{ReLU}}(z) = \max(0, z) = \begin{cases}
+z & \text{if } z > 0 \\
+0 & \text{if } z \leq 0
+\end{cases}
+\end{equation}
+
+The forward pass becomes:
+
+\begin{equation}
+Q(s, a; \theta) = W_2 \cdot \text{ReLU}(W_1 \cdot s + b_1) + b_2
+\end{equation}
+
+\subsection{LeakyReLU Network}
+
+For the LeakyReLU network, the activation function is:
+
+\begin{equation}
+\sigma_{\text{LeakyReLU}}(z) = \max(\alpha z, z) = \begin{cases}
+z & \text{if } z > 0 \\
+\alpha z & \text{if } z \leq 0
+\end{cases}
+\end{equation}
+
+where $\alpha = 0.01$ is the negative slope coefficient. The forward pass is:
+
+\begin{equation}
+Q(s, a; \theta) = W_2 \cdot \text{LeakyReLU}(W_1 \cdot s + b_1) + b_2
+\end{equation}
+
+\section{Feature Contribution Analysis}
+
+The feature contribution analysis reveals how each input feature contributes to the Q-value for each action. This is computed differently for each architecture.
+
+\subsection{Linear Network Feature Contributions}
+
+For the linear network, the effective weight matrix is:
+
+\begin{equation}
+W_{\text{eff}} = W_2 W_1 \in \mathbb{R}^{2 \times 4}
+\end{equation}
+
+The contribution of feature $i$ to action $j$ is:
+
+\begin{equation}
+\text{contrib}_{j,i} = (W_{\text{eff}})_{j,i} \cdot s_i
+\end{equation}
+
+\subsection{ReLU Network Feature Contributions}
+
+For the ReLU network, the feature contributions account for the activation mask:
+
+\begin{equation}
+m = \mathbb{1}[W_1 \cdot s + b_1 > 0] \in \{0, 1\}^{64}
+\end{equation}
+
+where $\mathbb{1}[\cdot]$ is the indicator function. The effective weight matrix becomes:
+
+\begin{equation}
+W_{\text{eff}} = (W_2 \odot m) W_1
+\end{equation}
+
+where $\odot$ denotes element-wise multiplication (broadcasted appropriately). The contributions are:
+
+\begin{equation}
+\text{contrib}_{j,i} = (W_{\text{eff}})_{j,i} \cdot s_i
+\end{equation}
+
+\subsection{LeakyReLU Network Feature Contributions}
+
+For the LeakyReLU network, the hidden layer activation is:
+
+\begin{equation}
+h = \text{LeakyReLU}(W_1 \cdot s + b_1)
+\end{equation}
+
+The contributions are computed directly from the activated hidden layer:
+
+\begin{equation}
+\text{contrib}_{j,i} = (W_2)_{j,:} \odot h \cdot (W_1)_{:,i} \cdot s_i
+\end{equation}
+
+\section{Deep Q-Learning Algorithm}
+
+All networks use the standard DQN algorithm with the following components.
+
+\subsection{Bellman Equation}
+
+The Q-function is updated using the Bellman equation:
+
+\begin{equation}
+Q^*(s, a) = \mathbb{E}_{s' \sim p(\cdot|s,a)} \left[ r + \gamma \max_{a'} Q^*(s', a') \right]
+\end{equation}
+
+where $r$ is the immediate reward, $\gamma = 0.99$ is the discount factor, and $p(\cdot|s,a)$ is the transition probability.
+
+\subsection{Temporal Difference (TD) Target}
+
+The TD target for training is:
+
+\begin{equation}
+y_t = r_t + \gamma \max_{a'} Q(s_{t+1}, a'; \theta^-)
+\end{equation}
+
+where $\theta^-$ are the parameters of the target network, which is updated periodically.
+
+\subsection{Loss Function}
+
+The loss function is the mean squared error between the current Q-values and the TD targets:
+
+\begin{equation}
+\mathcal{L}(\theta) = \mathbb{E}_{(s,a,r,s') \sim \mathcal{D}} \left[ \left( y_t - Q(s, a; \theta) \right)^2 \right]
+\end{equation}
+
+where $\mathcal{D}$ is the replay buffer.
+
+\subsection{Gradient Descent Update}
+
+The parameters are updated using gradient descent:
+
+\begin{equation}
+\theta \leftarrow \theta - \alpha \nabla_\theta \mathcal{L}(\theta)
+\end{equation}
+
+where $\alpha$ is the learning rate.
+
+\section{Training Stability Mechanisms}
+
+\subsection{Linear with Clipping Variant}
+
+The linear network with clipping includes several stability mechanisms:
+
+\subsubsection{Gradient Clipping}
+
+Gradients are clipped to prevent explosion:
+
+\begin{equation}
+\nabla_\theta \mathcal{L} \leftarrow \text{clip}\left( \nabla_\theta \mathcal{L}, -\text{max\_norm}, \text{max\_norm} \right)
+\end{equation}
+
+where $\text{max\_norm} = 1.0$ and the clipping is applied using the gradient norm:
+
+\begin{equation}
+\nabla_\theta \mathcal{L} \leftarrow \frac{\nabla_\theta \mathcal{L}}{\max(1, \|\nabla_\theta \mathcal{L}\| / \text{max\_norm})}
+\end{equation}
+
+\subsubsection{Target Q-Value Clipping}
+
+Target Q-values are clipped to prevent unbounded growth:
+
+\begin{equation}
+y_t \leftarrow \text{clip}(y_t, -Q_{\max}, Q_{\max})
+\end{equation}
+
+where $Q_{\max} = 100.0$.
+
+\subsubsection{Weight Initialization}
+
+Weights are initialized using Xavier uniform initialization:
+
+\begin{equation}
+W \sim \mathcal{U}\left(-\frac{\sqrt{6}}{\sqrt{n_{\text{in}} + n_{\text{out}}}}, \frac{\sqrt{6}}{\sqrt{n_{\text{in}} + n_{\text{out}}}}\right)
+\end{equation}
+
+where $n_{\text{in}}$ and $n_{\text{out}}$ are the input and output dimensions of the layer.
+
+\subsubsection{Target Network Update Frequency}
+
+The target network is updated every $N_{\text{update}} = 100$ steps (instead of every 500 episodes) for more frequent updates:
+
+\begin{equation}
+\theta^- \leftarrow \theta \quad \text{if } t \bmod N_{\text{update}} = 0
+\end{equation}
+
+\section{Hyperparameters Comparison}
+
+Table~\ref{tab:hyperparams} summarizes the hyperparameters for each variant.
+
+\begin{table}[h]
+\centering
+\caption{Hyperparameter Comparison}
+\label{tab:hyperparams}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Hyperparameter} & \textbf{Linear} & \textbf{Linear+Clip} & \textbf{ReLU} & \textbf{LeakyReLU} \\
+\midrule
+Learning Rate & $10^{-3}$ & $5 \times 10^{-4}$ & $10^{-3}$ & $10^{-3}$ \\
+Discount Factor ($\gamma$) & 0.99 & 0.99 & 0.99 & 0.99 \\
+Batch Size & 64 & 64 & 64 & 64 \\
+Replay Buffer Size & 10,000 & 10,000 & 10,000 & 10,000 \\
+$\epsilon$ Start & 1.0 & 1.0 & 1.0 & 1.0 \\
+$\epsilon$ End & 0.05 & 0.05 & 0.05 & 0.05 \\
+$\epsilon$ Decay & 0.999 & 0.999 & 0.999 & 0.999 \\
+Target Update (steps) & 500 episodes & 100 steps & 500 episodes & 500 episodes \\
+Gradient Clipping & No & Yes (1.0) & No & No \\
+Target Q Clipping & No & Yes ($\pm 100$) & No & No \\
+Weight Init & Default & Xavier & Default & Default \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Key Differences Summary}
+
+\subsection{Expressiveness}
+
+\begin{itemize}
+    \item \textbf{Linear}: Limited to linear decision boundaries. Cannot represent non-linear Q-functions.
+    \item \textbf{Linear+Clip}: Same expressiveness as linear, but with improved training stability.
+    \item \textbf{ReLU}: Can represent piecewise linear functions. Enables non-linear decision boundaries.
+    \item \textbf{LeakyReLU}: Similar to ReLU but allows small negative gradients, preventing "dying ReLU" problem.
+\end{itemize}
+
+\subsection{Training Dynamics}
+
+\begin{itemize}
+    \item \textbf{Linear}: Prone to gradient explosion and weight growth without bounds.
+    \item \textbf{Linear+Clip}: Stabilized training through gradient and target clipping, but still limited expressiveness.
+    \item \textbf{ReLU}: Stable training, but can suffer from "dying ReLU" where neurons become inactive.
+    \item \textbf{LeakyReLU}: More stable than ReLU, maintains gradient flow for negative inputs.
+\end{itemize}
+
+\subsection{Feature Contribution Computation}
+
+\begin{itemize}
+    \item \textbf{Linear}: Direct matrix multiplication $W_2 W_1$.
+    \item \textbf{Linear+Clip}: Same as linear.
+    \item \textbf{ReLU}: Requires masking based on activation: $(W_2 \odot m) W_1$.
+    \item \textbf{LeakyReLU}: Computed from activated hidden layer: $W_2 \odot h \cdot W_1$.
+\end{itemize}
+
+\section{Expected Performance}
+
+Based on the architecture differences:
+
+\begin{itemize}
+    \item \textbf{Linear}: Poor performance (average reward $\approx 10-11$ steps) due to limited expressiveness.
+    \item \textbf{Linear+Clip}: Similar poor performance but with more stable training (weight norms controlled).
+    \item \textbf{ReLU}: Good performance (can reach 200+ steps) due to non-linear expressiveness.
+    \item \textbf{LeakyReLU}: Good to excellent performance, potentially better than ReLU due to improved gradient flow.
+\end{itemize}
+
+\section{Mathematical Properties}
+
+\subsection{Composition of Linear Layers}
+
+For a linear network with two layers, the composition is equivalent to a single linear layer:
+
+\begin{equation}
+f_2 \circ f_1(x) = W_2(W_1 x + b_1) + b_2 = (W_2 W_1)x + (W_2 b_1 + b_2)
+\end{equation}
+
+This means a two-layer linear network has the same representational capacity as a single-layer network.
+
+\subsection{ReLU Non-Linearity}
+
+ReLU introduces non-linearity through the piecewise linear function:
+
+\begin{equation}
+\text{ReLU}(z) = \max(0, z) = \frac{z + |z|}{2}
+\end{equation}
+
+The derivative is:
+
+\begin{equation}
+\frac{d}{dz}\text{ReLU}(z) = \begin{cases}
+1 & \text{if } z > 0 \\
+0 & \text{if } z \leq 0
+\end{cases}
+\end{equation}
+
+\subsection{LeakyReLU Non-Linearity}
+
+LeakyReLU maintains a small gradient for negative inputs:
+
+\begin{equation}
+\text{LeakyReLU}(z) = \max(\alpha z, z) = \begin{cases}
+z & \text{if } z > 0 \\
+\alpha z & \text{if } z \leq 0
+\end{cases}
+\end{equation}
+
+The derivative is:
+
+\begin{equation}
+\frac{d}{dz}\text{LeakyReLU}(z) = \begin{cases}
+1 & \text{if } z > 0 \\
+\alpha & \text{if } z \leq 0
+\end{cases}
+\end{equation}
+
+where typically $\alpha = 0.01$.
+
+\section{Conclusion}
+
+The comparison reveals fundamental trade-offs between expressiveness and training stability:
+
+\begin{enumerate}
+    \item \textbf{Linear networks} are limited in expressiveness but can be stabilized with clipping mechanisms.
+    \item \textbf{ReLU networks} provide non-linear expressiveness essential for complex Q-functions.
+    \item \textbf{LeakyReLU networks} offer similar expressiveness to ReLU with improved gradient flow.
+    \item \textbf{Stability mechanisms} (gradient clipping, target clipping) are crucial for linear networks but less critical for ReLU-based networks.
+\end{enumerate}
+
+The choice of activation function fundamentally determines the network's ability to learn effective policies in reinforcement learning tasks.
+
+\end{document}
