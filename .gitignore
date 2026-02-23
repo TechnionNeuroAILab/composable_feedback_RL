@@ -7,6 +7,9 @@
 !context/
 !paper/
 !environment.yml
+!2layers_dqns/
+!2layers_dqns/**
+!*.ipynb
 
 # Python
 __pycache__/
