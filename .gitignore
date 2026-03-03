@@ -11,6 +11,8 @@
 !environment.yml
 !2layers_dqns/
 !2layers_dqns/**
+!cleanRL_models/
+!cleanRL_models/**
 !*.ipynb
 
 # Python
