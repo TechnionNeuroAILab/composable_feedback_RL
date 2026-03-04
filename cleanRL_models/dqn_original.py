@@ -3,6 +3,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
@@ -124,7 +125,10 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+    script_dir = Path(__file__).resolve().parent
+    runs_dir = script_dir / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(str(runs_dir / run_name))
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -235,8 +239,8 @@ if __name__ == "__main__":
                     )
 
     if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-        torch.save(q_network.state_dict(), model_path)
+        model_path = runs_dir / run_name / f"{args.exp_name}.cleanrl_model"
+        torch.save(q_network.state_dict(), str(model_path))
         print(f"model saved to {model_path}")
         from cleanrl_utils.evals.dqn_eval import evaluate
 
@@ -258,7 +262,7 @@ if __name__ == "__main__":
 
             repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "DQN", f"runs/{run_name}", f"videos/{run_name}-eval")
+            push_to_hub(args, episodic_returns, repo_id, "DQN", str(runs_dir / run_name), f"videos/{run_name}-eval")
 
     envs.close()
     writer.close()
