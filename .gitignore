@@ -5,6 +5,7 @@
 !.gitignore
 !code/
 !context/
+!context/**
 !paper/
 !paper/**
 !*.tex
