@@ -1,0 +1,43 @@
+======================================================================
+BIKE ENVIRONMENT TRAINING REPORT
+======================================================================
+
+GENERAL STATISTICS:
+----------------------------------------------------------------------
+Total Episodes: 1,607
+Total Timesteps: 499,612
+Training Duration: 1920.64 seconds
+
+REWARD STATISTICS:
+----------------------------------------------------------------------
+Mean Reward: 1729.45
+Std Reward: 770.70
+Median Reward: 1470.10
+Max Reward: 3941.55
+Min Reward: 501.86
+25th Percentile: 1018.21
+75th Percentile: 2404.15
+
+EPISODE LENGTH STATISTICS:
+----------------------------------------------------------------------
+Mean Length: 310.90 timesteps
+Std Length: 79.80 timesteps
+Median Length: 300.00 timesteps
+Max Length: 583 timesteps
+Min Length: 180 timesteps
+
+LEARNING PROGRESS:
+----------------------------------------------------------------------
+First 100 Episodes Mean: 1427.03
+Last 100 Episodes Mean: 2557.68
+Improvement: +79.23%
+
+Best Episode: 1439 (Reward: 3941.55)
+Worst Episode: 73 (Reward: 501.86)
+
+PERFORMANCE BY TRAINING PHASE:
+----------------------------------------------------------------------
+Quarter 1 (Episodes 0-401): 1234.38 ± 313.96
+Quarter 2 (Episodes 401-802): 953.24 ± 111.59
+Quarter 3 (Episodes 802-1203): 2093.63 ± 563.28
+Quarter 4 (Episodes 1203-1607): 2629.81 ± 392.37
