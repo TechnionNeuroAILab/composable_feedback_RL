@@ -4,6 +4,7 @@
 # But don't ignore these specific files/folders
 !.gitignore
 !code/
+!code/**
 !context/
 !context/**
 !paper/
@@ -43,6 +44,9 @@ ENV/
 runs/
 wandb/
 tb_logs/
+
+## Large / regenerable experiment checkpoints
+paper/_tmp_b_feedb_cg/
 
 ## OS / editor
 .DS_Store
