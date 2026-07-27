@@ -52,7 +52,7 @@ if str(CODE_DIR) not in sys.path:
 import confgate_analytical as cg_analytical  # noqa: E402
 import confgate_learnable  as cg_learnable   # noqa: E402
 
-FIG_DIR = ROOT / "paper" / "figures" / "conf_fourway"
+FIG_DIR = ROOT / "paper" / "figures" / "fourway_gate"
 
 # ---------------------------------------------------------------------------
 # Hyper-parameters (must match sibling modules)
@@ -76,14 +76,28 @@ RNN_HIDDEN = 20
 DEFAULT_SEEDS       = list(range(1, 11))
 DEFAULT_TOTAL_STEPS = 500_000
 
-ALL_MODALITIES = ["baseline", "analytical", "learnable", "rnn", "rnn_reinforce"]
+ALL_MODALITIES = [
+    "baseline", "analytical", "learnable",
+    "rnn", "rnn_reinforce", "gru_burnin",
+    "lstm", "lstm_burnin",
+]
+
+# Burn-in hyper-parameters (shared by GRU and LSTM burn-in modalities)
+LSTM_SEQ_LEN      = 20    # total sequence length stored per entry
+LSTM_BURN_IN      = 10    # steps used to warm up hidden state, no gradient
+LSTM_LEARN_LEN    = LSTM_SEQ_LEN - LSTM_BURN_IN   # steps that produce loss (10)
+LSTM_SEQ_BATCH    = 32    # sequences per training step (≈ 320 transition-equivalents)
+LSTM_SEQ_BUFFER   = 2_000 # max sequences in the burn-in replay buffer
 
 # Plotting colours
-COLOR_BASE      = "#2ca02c"   # green  – baseline
-COLOR_GATE      = "#9467bd"   # purple – analytical
-COLOR_LEARN     = "#d62728"   # red    – learnable
-COLOR_RNN       = "#ff7f0e"   # orange – RNN controller (original)
-COLOR_REINFORCE = "#1f77b4"   # blue   – RNN controller with REINFORCE
+COLOR_BASE      = "#2ca02c"   # green      – baseline
+COLOR_GATE      = "#9467bd"   # purple     – analytical
+COLOR_LEARN     = "#d62728"   # red        – learnable
+COLOR_RNN       = "#ff7f0e"   # orange     – GRU controller (direct gradient)
+COLOR_GRU_BI    = "#bcbd22"   # olive      – GRU controller with burn-in
+COLOR_REINFORCE = "#1f77b4"   # blue       – RNN controller with REINFORCE
+COLOR_LSTM      = "#e377c2"   # pink       – LSTM controller (single-step)
+COLOR_LSTM_BI   = "#17becf"   # teal       – LSTM controller with burn-in
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +226,62 @@ class RNNController_with_loss_improvement(nn.Module):
             "lr_mult":   F.softplus(out[:, 0]) + 1e-3,     # > 0
             "eps_floor": torch.sigmoid(out[:, 1]) * END_E, # ∈ [0, END_E]
         }, h_next
+
+
+# ---------------------------------------------------------------------------
+# LSTM Controller (modality 5)
+# ---------------------------------------------------------------------------
+class LSTMController(nn.Module):
+    """
+    20-unit LSTMCell controller — identical inputs and outputs to RNNController
+    but uses an LSTM cell instead of a GRU cell.
+
+    LSTM maintains two separate state vectors per step:
+      h  (hidden state)  — carries short-term sequential patterns
+      c  (cell state)    — carries long-term memory via input/forget gates
+
+    This gives the controller an extra degree of freedom compared to the GRU:
+    the cell state can accumulate signals over many steps while the hidden state
+    is gated more selectively.  Both states are stored in the replay buffer and
+    replayed with each transition.
+
+    Inputs  (126 dims, all detached from the Q-learning graph):
+        concat(Q_full.detach, Q_cart.detach, Q_pole.detach, z.detach)
+    Outputs (same four scalars as RNNController):
+        lr_mult   ∈ (0, ∞),    init ≈ 1.0
+        eps_floor ∈ [0, END_E], init ≈ END_E
+        k_cart    ∈ (0, ∞),    init ≈ 1.0
+        k_pole    ∈ (0, ∞),    init ≈ 1.0
+    """
+
+    LSTM_INPUT  = 2 + 2 + 2 + OBS_TO_120  # 126
+    LSTM_HIDDEN = RNN_HIDDEN               # 20
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lstm_cell   = nn.LSTMCell(self.LSTM_INPUT, self.LSTM_HIDDEN)
+        self.output_head = nn.Linear(self.LSTM_HIDDEN, 4)
+        with torch.no_grad():
+            self.output_head.bias.data = torch.tensor(
+                [0.5413, 5.0, 0.5413, 0.5413], dtype=torch.float32
+            )
+            nn.init.zeros_(self.output_head.weight)
+
+    def forward(
+        self,
+        x:  torch.Tensor,                           # (B, 126) — caller must detach
+        hc: Tuple[torch.Tensor, torch.Tensor],       # (h, c) each (B, LSTM_HIDDEN)
+    ) -> Tuple[Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        """Returns (lstm_out dict, (h_next, c_next)).  All values in dict are (B,)."""
+        h, c = hc
+        h_next, c_next = self.lstm_cell(x, (h, c))
+        out = self.output_head(h_next)              # (B, 4)
+        return {
+            "lr_mult":   F.softplus(out[:, 0]) + 1e-3,
+            "eps_floor": torch.sigmoid(out[:, 1]) * END_E,
+            "k_cart":    F.softplus(out[:, 2]) + 1e-3,
+            "k_pole":    F.softplus(out[:, 3]) + 1e-3,
+        }, (h_next, c_next)
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +444,9 @@ class BFeedbackRNNControllerNetwork(nn.Module):
     # ------------------------------------------------------------------
     def forward(
         self,
-        obs: torch.Tensor,     # (B, obs_dim)
-        h_prev: torch.Tensor,  # (B, RNN_HIDDEN)
+        obs: torch.Tensor,       # (B, obs_dim)
+        h_prev: torch.Tensor,    # (B, RNN_HIDDEN)
+        detach_k: bool = False,  # if True, detach k_cart/k_pole before z_gated
     ) -> Tuple[
         torch.Tensor,           # Q_full_gated  (B, n_actions)
         torch.Tensor,           # Q_cart        (B, n_actions)
@@ -402,9 +473,14 @@ class BFeedbackRNNControllerNetwork(nn.Module):
         )  # (B, 126)
         rnn_out, h_next = self.rnn_controller(rnn_input, h_prev)
 
-        # ---- Pass 2: gated path (k NOT detached → grad reaches RNN) ----
+        # ---- Pass 2: gated path ----
+        # detach_k=True: k_cart/k_pole are detached before z_gated so the
+        # multi-step BPTT gradient does NOT flow through the gate path.
+        # This prevents gradient explosion when training with burn-in.
         if self._gating_active():
-            z_gated      = self._gated_z(obs, rnn_out["k_cart"], rnn_out["k_pole"])
+            k_c = rnn_out["k_cart"].detach() if detach_k else rnn_out["k_cart"]
+            k_p = rnn_out["k_pole"].detach() if detach_k else rnn_out["k_pole"]
+            z_gated      = self._gated_z(obs, k_c, k_p)
             Q_full_gated = self.head_full(self.trunk(z_gated))
         else:
             Q_full_gated = Q_full_ungated
@@ -416,6 +492,121 @@ class BFeedbackRNNControllerNetwork(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         Q_full_gated, _, _, _, h_next, _ = self.forward(obs, h_prev)
         return Q_full_gated, h_next
+
+
+# ---------------------------------------------------------------------------
+# Network — 3-head DQN + LSTMController (modality 5)
+# ---------------------------------------------------------------------------
+class BFeedbackLSTMControllerNetwork(nn.Module):
+    """
+    Identical 3-head backbone to BFeedbackRNNControllerNetwork, but the
+    meta-controller is an LSTMController rather than a GRUCell.
+
+    Because the LSTM has two state vectors (h, c), the network accepts and
+    returns (h_prev, c_prev) / (h_next, c_next) pairs rather than a single
+    hidden state.  The gradient path for the controller is the same as for
+    the GRU modality:
+        loss_full → Q_full_gated → z_gated → k_cart / k_pole
+                  → output_head → LSTMCell weights
+    """
+
+    def __init__(self, obs_dim: int, n_actions: int) -> None:
+        super().__init__()
+        self.obs_dim   = obs_dim
+        self.n_actions = n_actions
+
+        self.linear_feature   = nn.Linear(obs_dim, OBS_TO_120)
+        self.trunk = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(OBS_TO_120, HIDDEN_84),
+            nn.ReLU(),
+        )
+        self.head_full = nn.Linear(HIDDEN_84, n_actions)
+        self.head_cart = nn.Linear(HIDDEN_84, n_actions)
+        self.head_pole = nn.Linear(HIDDEN_84, n_actions)
+        self.lstm_controller = LSTMController()
+
+    def _gating_active(self) -> bool:
+        return self.obs_dim == 4 and self.n_actions == 2
+
+    @staticmethod
+    def _mask_cart(obs: torch.Tensor) -> torch.Tensor:
+        out = obs.clone(); out[..., 2:4] = 0.0; return out
+
+    @staticmethod
+    def _mask_pole(obs: torch.Tensor) -> torch.Tensor:
+        out = obs.clone(); out[..., 0:2] = 0.0; return out
+
+    def _gated_z(
+        self,
+        obs:    torch.Tensor,   # (B, obs_dim)
+        k_cart: torch.Tensor,   # (B,) — NOT detached so grad reaches LSTM
+        k_pole: torch.Tensor,   # (B,)
+    ) -> torch.Tensor:
+        W  = self.linear_feature.weight
+        b  = self.linear_feature.bias
+        kc = k_cart.unsqueeze(-1)
+        kp = k_pole.unsqueeze(-1)
+        return (
+            kc * (obs[..., 0:2] @ W[:, 0:2].T)
+            + kp * (obs[..., 2:4] @ W[:, 2:4].T)
+            + b
+        )
+
+    def zero_hidden(
+        self, device: torch.device, dtype: torch.dtype = torch.float32
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (h, c) zero states, each (1, LSTM_HIDDEN), for rollout init."""
+        z = torch.zeros(1, RNN_HIDDEN, device=device, dtype=dtype)
+        return z, z.clone()
+
+    def forward(
+        self,
+        obs:    torch.Tensor,                          # (B, obs_dim)
+        h_prev: torch.Tensor,                          # (B, RNN_HIDDEN)
+        c_prev: torch.Tensor,                          # (B, RNN_HIDDEN)
+    ) -> Tuple[
+        torch.Tensor,                                  # Q_full_gated  (B, n_actions)
+        torch.Tensor,                                  # Q_cart        (B, n_actions)
+        torch.Tensor,                                  # Q_pole        (B, n_actions)
+        torch.Tensor,                                  # z_ungated     (B, 120)
+        torch.Tensor,                                  # h_next        (B, RNN_HIDDEN)
+        torch.Tensor,                                  # c_next        (B, RNN_HIDDEN)
+        Dict[str, torch.Tensor],                       # lstm_out
+    ]:
+        z_cart = self.linear_feature(self._mask_cart(obs))
+        Q_cart = self.head_cart(self.trunk(z_cart.detach()))
+
+        z_pole = self.linear_feature(self._mask_pole(obs))
+        Q_pole = self.head_pole(self.trunk(z_pole.detach()))
+
+        z              = self.linear_feature(obs)
+        Q_full_ungated = self.head_full(self.trunk(z))
+
+        lstm_input = torch.cat(
+            [Q_full_ungated.detach(), Q_cart.detach(), Q_pole.detach(), z.detach()],
+            dim=-1,
+        )  # (B, 126)
+        lstm_out, (h_next, c_next) = self.lstm_controller(
+            lstm_input, (h_prev, c_prev)
+        )
+
+        if self._gating_active():
+            z_gated      = self._gated_z(obs, lstm_out["k_cart"], lstm_out["k_pole"])
+            Q_full_gated = self.head_full(self.trunk(z_gated))
+        else:
+            Q_full_gated = Q_full_ungated
+
+        return Q_full_gated, Q_cart, Q_pole, z, h_next, c_next, lstm_out
+
+    def forward_q_only(
+        self,
+        obs:    torch.Tensor,
+        h_prev: torch.Tensor,
+        c_prev: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        Q_full_gated, _, _, _, h_next, c_next, _ = self.forward(obs, h_prev, c_prev)
+        return Q_full_gated, h_next, c_next
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +670,322 @@ class RNNReplayBuffer:
             dones             = torch.tensor(self.dones[idx],             device=self.device),
             rewards           = torch.tensor(self.rewards[idx],           device=self.device),
             gate_h_in         = torch.tensor(self.gate_h_in[idx],        device=self.device),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Replay buffer — LSTM (stores h_in and c_in separately)
+# ---------------------------------------------------------------------------
+_LSTMSamples = namedtuple(
+    "_LSTMSamples",
+    ["observations", "actions", "next_observations", "dones", "rewards",
+     "gate_h_in", "gate_c_in"],
+)
+
+
+class LSTMReplayBuffer:
+    """Uniform replay buffer that stores both h_in and c_in per transition."""
+
+    def __init__(
+        self,
+        buffer_size: int,
+        obs_shape: Tuple[int, ...],
+        hidden_size: int,
+        device: torch.device,
+    ) -> None:
+        self.buffer_size = buffer_size
+        self.device      = device
+        self.pos  = 0
+        self.full = False
+
+        self.observations      = np.zeros((buffer_size, *obs_shape), dtype=np.float32)
+        self.next_observations = np.zeros((buffer_size, *obs_shape), dtype=np.float32)
+        self.actions           = np.zeros((buffer_size,), dtype=np.int64)
+        self.rewards           = np.zeros((buffer_size,), dtype=np.float32)
+        self.dones             = np.zeros((buffer_size,), dtype=np.float32)
+        self.gate_h_in         = np.zeros((buffer_size, hidden_size), dtype=np.float32)
+        self.gate_c_in         = np.zeros((buffer_size, hidden_size), dtype=np.float32)
+
+    def add(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: int,
+        reward: float,
+        done: float,
+        h_in: np.ndarray,
+        c_in: np.ndarray,
+    ) -> None:
+        self.observations[self.pos]      = obs
+        self.next_observations[self.pos] = next_obs
+        self.actions[self.pos]   = action
+        self.rewards[self.pos]   = reward
+        self.dones[self.pos]     = done
+        self.gate_h_in[self.pos] = h_in
+        self.gate_c_in[self.pos] = c_in
+        self.pos  = (self.pos + 1) % self.buffer_size
+        self.full = self.full or self.pos == 0
+
+    def __len__(self) -> int:
+        return self.buffer_size if self.full else self.pos
+
+    def sample(self, batch_size: int) -> _LSTMSamples:
+        idx = np.random.randint(0, len(self), size=batch_size)
+        return _LSTMSamples(
+            observations      = torch.tensor(self.observations[idx],      device=self.device),
+            actions           = torch.tensor(self.actions[idx],           device=self.device).unsqueeze(1),
+            next_observations = torch.tensor(self.next_observations[idx], device=self.device),
+            dones             = torch.tensor(self.dones[idx],             device=self.device),
+            rewards           = torch.tensor(self.rewards[idx],           device=self.device),
+            gate_h_in         = torch.tensor(self.gate_h_in[idx],        device=self.device),
+            gate_c_in         = torch.tensor(self.gate_c_in[idx],        device=self.device),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sequence replay buffer for LSTM burn-in (modality 7)
+# ---------------------------------------------------------------------------
+_BurnInSamples = namedtuple(
+    "_BurnInSamples",
+    ["obs_seq", "next_obs_seq", "actions", "rewards", "dones", "h0", "c0"],
+)
+
+
+class LSTMBurnInBuffer:
+    """
+    Replay buffer that stores fixed-length sequences of transitions together
+    with the LSTM state (h0, c0) at the start of each sequence.
+
+    This enables proper burn-in training (R2D2-style):
+      • The first LSTM_BURN_IN steps of each sequence are run under torch.no_grad()
+        to re-warm the hidden state using the current network weights.
+      • Only the remaining LSTM_LEARN_LEN steps contribute to the TD loss,
+        and BPTT flows through all of them.
+
+    Sequence storage layout (per entry):
+      obs_seq      : (SEQ_LEN, obs_dim)  — observations for each step
+      next_obs_seq : (SEQ_LEN, obs_dim)  — corresponding next observations
+      actions      : (SEQ_LEN,)
+      rewards      : (SEQ_LEN,)
+      dones        : (SEQ_LEN,)          — 1.0 where an episode ended
+      h0           : (RNN_HIDDEN,)       — hidden state at sequence start
+      c0           : (RNN_HIDDEN,)       — cell state at sequence start
+
+    Sequences may span episode boundaries; the training loop zeroes h/c
+    wherever dones[t] == 1 before processing the next step.
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        obs_shape: Tuple[int, ...],
+        hidden_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> None:
+        self.buffer_size = buffer_size
+        self.seq_len     = seq_len
+        self.device      = device
+        self.pos         = 0
+        self.full        = False
+
+        self.obs_seq      = np.zeros((buffer_size, seq_len, *obs_shape), dtype=np.float32)
+        self.next_obs_seq = np.zeros((buffer_size, seq_len, *obs_shape), dtype=np.float32)
+        self.actions      = np.zeros((buffer_size, seq_len),             dtype=np.int64)
+        self.rewards      = np.zeros((buffer_size, seq_len),             dtype=np.float32)
+        self.dones        = np.zeros((buffer_size, seq_len),             dtype=np.float32)
+        self.h0           = np.zeros((buffer_size, hidden_size),          dtype=np.float32)
+        self.c0           = np.zeros((buffer_size, hidden_size),          dtype=np.float32)
+
+    def add(
+        self,
+        obs_seq:      np.ndarray,   # (seq_len, obs_dim)
+        next_obs_seq: np.ndarray,   # (seq_len, obs_dim)
+        actions:      np.ndarray,   # (seq_len,) int64
+        rewards:      np.ndarray,   # (seq_len,)
+        dones:        np.ndarray,   # (seq_len,)
+        h0:           np.ndarray,   # (hidden_size,)
+        c0:           np.ndarray,   # (hidden_size,)
+    ) -> None:
+        self.obs_seq[self.pos]      = obs_seq
+        self.next_obs_seq[self.pos] = next_obs_seq
+        self.actions[self.pos]      = actions
+        self.rewards[self.pos]      = rewards
+        self.dones[self.pos]        = dones
+        self.h0[self.pos]           = h0
+        self.c0[self.pos]           = c0
+        self.pos  = (self.pos + 1) % self.buffer_size
+        self.full = self.full or self.pos == 0
+
+    def __len__(self) -> int:
+        return self.buffer_size if self.full else self.pos
+
+    def sample(self, batch_size: int) -> _BurnInSamples:
+        idx = np.random.randint(0, len(self), size=batch_size)
+        return _BurnInSamples(
+            obs_seq      = torch.tensor(self.obs_seq[idx],      device=self.device),
+            next_obs_seq = torch.tensor(self.next_obs_seq[idx], device=self.device),
+            actions      = torch.tensor(self.actions[idx],      device=self.device),
+            rewards      = torch.tensor(self.rewards[idx],      device=self.device),
+            dones        = torch.tensor(self.dones[idx],        device=self.device),
+            h0           = torch.tensor(self.h0[idx],           device=self.device),
+            c0           = torch.tensor(self.c0[idx],           device=self.device),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sequence replay buffer for LSTM burn-in (modality 7)
+# ---------------------------------------------------------------------------
+_BurnInSamples = namedtuple(
+    "_BurnInSamples",
+    ["obs_seq", "next_obs_seq", "actions", "rewards", "dones", "h0", "c0"],
+)
+
+
+class LSTMBurnInBuffer:
+    """
+    Stores fixed-length sequences of transitions + the LSTM state (h0, c0)
+    at the start of each sequence.
+
+    This enables R2D2-style burn-in training:
+      - Steps 0..BURN_IN-1 are run with torch.no_grad() to re-warm (h, c).
+      - Steps BURN_IN..SEQ_LEN-1 accumulate TD loss; BPTT flows through them.
+      - Episode boundaries within a sequence are handled by zeroing (h, c)
+        wherever dones[t] == 1 before processing step t+1.
+
+    Buffer entry shape:
+      obs_seq / next_obs_seq : (SEQ_LEN, obs_dim)
+      actions / rewards / dones : (SEQ_LEN,)
+      h0 / c0                : (RNN_HIDDEN,)
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        obs_shape:   Tuple[int, ...],
+        hidden_size: int,
+        seq_len:     int,
+        device:      torch.device,
+    ) -> None:
+        self.buffer_size = buffer_size
+        self.seq_len     = seq_len
+        self.device      = device
+        self.pos  = 0
+        self.full = False
+
+        self.obs_seq      = np.zeros((buffer_size, seq_len, *obs_shape), dtype=np.float32)
+        self.next_obs_seq = np.zeros((buffer_size, seq_len, *obs_shape), dtype=np.float32)
+        self.actions      = np.zeros((buffer_size, seq_len),             dtype=np.int64)
+        self.rewards      = np.zeros((buffer_size, seq_len),             dtype=np.float32)
+        self.dones        = np.zeros((buffer_size, seq_len),             dtype=np.float32)
+        self.h0           = np.zeros((buffer_size, hidden_size),          dtype=np.float32)
+        self.c0           = np.zeros((buffer_size, hidden_size),          dtype=np.float32)
+
+    def add(
+        self,
+        obs_seq:      np.ndarray,
+        next_obs_seq: np.ndarray,
+        actions:      np.ndarray,
+        rewards:      np.ndarray,
+        dones:        np.ndarray,
+        h0:           np.ndarray,
+        c0:           np.ndarray,
+    ) -> None:
+        self.obs_seq[self.pos]      = obs_seq
+        self.next_obs_seq[self.pos] = next_obs_seq
+        self.actions[self.pos]      = actions
+        self.rewards[self.pos]      = rewards
+        self.dones[self.pos]        = dones
+        self.h0[self.pos]           = h0
+        self.c0[self.pos]           = c0
+        self.pos  = (self.pos + 1) % self.buffer_size
+        self.full = self.full or self.pos == 0
+
+    def __len__(self) -> int:
+        return self.buffer_size if self.full else self.pos
+
+    def sample(self, batch_size: int) -> _BurnInSamples:
+        idx = np.random.randint(0, len(self), size=batch_size)
+        return _BurnInSamples(
+            obs_seq      = torch.tensor(self.obs_seq[idx],      device=self.device),
+            next_obs_seq = torch.tensor(self.next_obs_seq[idx], device=self.device),
+            actions      = torch.tensor(self.actions[idx],      device=self.device),
+            rewards      = torch.tensor(self.rewards[idx],      device=self.device),
+            dones        = torch.tensor(self.dones[idx],        device=self.device),
+            h0           = torch.tensor(self.h0[idx],           device=self.device),
+            c0           = torch.tensor(self.c0[idx],           device=self.device),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sequence replay buffer for GRU burn-in
+# ---------------------------------------------------------------------------
+_GRUBurnInSamples = namedtuple(
+    "_GRUBurnInSamples",
+    ["obs_seq", "next_obs_seq", "actions", "rewards", "dones", "h0"],
+)
+
+
+class GRUBurnInBuffer:
+    """
+    Replay buffer that stores fixed-length sequences of transitions together
+    with the GRU hidden state h0 at the start of each sequence.
+
+    Identical in spirit to LSTMBurnInBuffer but stores only h0 (no cell state)
+    since the GRU uses a single recurrent vector.
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        obs_shape:   Tuple[int, ...],
+        hidden_size: int,
+        seq_len:     int,
+        device:      torch.device,
+    ) -> None:
+        self.buffer_size = buffer_size
+        self.seq_len     = seq_len
+        self.device      = device
+        self.pos  = 0
+        self.full = False
+
+        self.obs_seq      = np.zeros((buffer_size, seq_len, *obs_shape), dtype=np.float32)
+        self.next_obs_seq = np.zeros((buffer_size, seq_len, *obs_shape), dtype=np.float32)
+        self.actions      = np.zeros((buffer_size, seq_len),             dtype=np.int64)
+        self.rewards      = np.zeros((buffer_size, seq_len),             dtype=np.float32)
+        self.dones        = np.zeros((buffer_size, seq_len),             dtype=np.float32)
+        self.h0           = np.zeros((buffer_size, hidden_size),          dtype=np.float32)
+
+    def add(
+        self,
+        obs_seq:      np.ndarray,
+        next_obs_seq: np.ndarray,
+        actions:      np.ndarray,
+        rewards:      np.ndarray,
+        dones:        np.ndarray,
+        h0:           np.ndarray,
+    ) -> None:
+        self.obs_seq[self.pos]      = obs_seq
+        self.next_obs_seq[self.pos] = next_obs_seq
+        self.actions[self.pos]      = actions
+        self.rewards[self.pos]      = rewards
+        self.dones[self.pos]        = dones
+        self.h0[self.pos]           = h0
+        self.pos  = (self.pos + 1) % self.buffer_size
+        self.full = self.full or self.pos == 0
+
+    def __len__(self) -> int:
+        return self.buffer_size if self.full else self.pos
+
+    def sample(self, batch_size: int) -> _GRUBurnInSamples:
+        idx = np.random.randint(0, len(self), size=batch_size)
+        return _GRUBurnInSamples(
+            obs_seq      = torch.tensor(self.obs_seq[idx],      device=self.device),
+            next_obs_seq = torch.tensor(self.next_obs_seq[idx], device=self.device),
+            actions      = torch.tensor(self.actions[idx],      device=self.device),
+            rewards      = torch.tensor(self.rewards[idx],      device=self.device),
+            dones        = torch.tensor(self.dones[idx],        device=self.device),
+            h0           = torch.tensor(self.h0[idx],           device=self.device),
         )
 
 
@@ -954,6 +1461,220 @@ def run_one_rnn_reinforce(
 
 
 # ---------------------------------------------------------------------------
+# Training loop — modality 5 (LSTM controller)
+# ---------------------------------------------------------------------------
+def run_one_lstm(
+    seed: int,
+    total_timesteps: int,
+    device: torch.device,
+    checkpoint_dir: Optional[Path] = None,
+    epsilon_decay_episodes: int = EPSILON_DECAY_EPISODES,
+    total_episodes: Optional[int] = None,
+    target_freq: int = TARGET_NETWORK_FREQ,
+    main_grad_clip: float = 10.0,
+    learning_starts: int = LEARNING_STARTS,
+    train_frequency: int = TRAIN_FREQUENCY,
+) -> Dict:
+    """Single-seed training for the LSTM meta-controller (modality 5).
+
+    Mirrors run_one_rnn exactly, but uses BFeedbackLSTMControllerNetwork and
+    LSTMReplayBuffer.  The key difference is that both h and c are stored per
+    transition and replayed; the gradient path is identical to the GRU modality
+    (k_cart / k_pole are not detached, so loss_full → z_gated → k → LSTM weights).
+    """
+    _set_seed(seed)
+    env = gym.make("CartPole-v1")
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+
+    obs_dim   = int(np.prod(env.observation_space.shape))
+    n_actions = env.action_space.n
+    label     = f"seed={seed}"
+
+    q_net = BFeedbackLSTMControllerNetwork(obs_dim, n_actions).to(device)
+    t_net = BFeedbackLSTMControllerNetwork(obs_dim, n_actions).to(device)
+    t_net.load_state_dict(q_net.state_dict())
+
+    opt_main = optim.Adam(
+        list(q_net.linear_feature.parameters())
+        + list(q_net.trunk.parameters())
+        + list(q_net.head_full.parameters())
+        + list(q_net.lstm_controller.parameters()),
+        lr=LEARNING_RATE,
+    )
+    opt_aux = optim.Adam(
+        list(q_net.head_cart.parameters()) + list(q_net.head_pole.parameters()),
+        lr=LEARNING_RATE,
+    )
+
+    rb = LSTMReplayBuffer(BUFFER_SIZE, env.observation_space.shape, RNN_HIDDEN, device)
+
+    episode_returns: List[float] = []
+    lstm_history:   List[Dict]   = []
+    loss_list:      List[float]  = []
+
+    _eps_end   = END_E
+    _eps_decay = float(epsilon_decay_episodes)
+
+    h, c = q_net.zero_hidden(device)   # (1, RNN_HIDDEN) each
+
+    obs, _ = env.reset(seed=seed)
+    t = 0
+
+    while t < total_timesteps and (
+        total_episodes is None or len(episode_returns) < total_episodes
+    ):
+        h_in_np = h.squeeze(0).cpu().numpy()   # (RNN_HIDDEN,)
+        c_in_np = c.squeeze(0).cpu().numpy()
+
+        with torch.no_grad():
+            obs_t  = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            Q_act, h_next, c_next = q_net.forward_q_only(obs_t, h, c)
+        h = h_next.detach()
+        c = c_next.detach()
+
+        n_ep_done = len(episode_returns)
+        eps = _linear_schedule(START_E, _eps_end, int(_eps_decay), n_ep_done)
+        action = (
+            env.action_space.sample()
+            if random.random() < eps
+            else int(Q_act.argmax(dim=1).item())
+        )
+
+        next_obs, reward, terminated, truncated, infos = env.step(action)
+        done     = terminated or truncated
+        real_nxt = next_obs.copy()
+        if truncated and "final_observation" in infos:
+            real_nxt = infos["final_observation"]
+
+        rb.add(obs, real_nxt, action, float(reward), float(done), h_in_np, c_in_np)
+
+        if "episode" in infos:
+            episode_returns.append(float(np.asarray(infos["episode"]["r"]).item()))
+
+        obs = next_obs
+        if done:
+            obs, _ = env.reset()
+            h, c = q_net.zero_hidden(device)
+
+        if t > learning_starts and t % train_frequency == 0 and len(rb) >= BATCH_SIZE:
+            data = rb.sample(BATCH_SIZE)
+
+            with torch.no_grad():
+                B        = data.observations.shape[0]
+                h_zeros  = torch.zeros(B, RNN_HIDDEN, device=device)
+                c_zeros  = torch.zeros(B, RNN_HIDDEN, device=device)
+                tQ_full, tQ_cart, tQ_pole, _, _, _, _ = t_net.forward(
+                    data.next_observations, h_zeros, c_zeros
+                )
+                r      = data.rewards.flatten()
+                d      = data.dones.flatten()
+                y_full = r + GAMMA * (1 - d) * tQ_full.max(dim=1).values
+                y_cart = r + GAMMA * (1 - d) * tQ_cart.max(dim=1).values
+                y_pole = r + GAMMA * (1 - d) * tQ_pole.max(dim=1).values
+
+            Q_full, Q_cart, Q_pole, _z, _h, _c, lstm_out = q_net.forward(
+                data.observations, data.gate_h_in, data.gate_c_in
+            )
+
+            qf_sa = Q_full.gather(1, data.actions).squeeze()
+            qc_sa = Q_cart.gather(1, data.actions).squeeze()
+            qp_sa = Q_pole.gather(1, data.actions).squeeze()
+
+            loss_full = F.mse_loss(y_full, qf_sa)
+            loss_cart = F.mse_loss(y_cart, qc_sa)
+            loss_pole = F.mse_loss(y_pole, qp_sa)
+
+            lr_mult_val   = float(lstm_out["lr_mult"].mean().item())
+            eps_floor_val = float(lstm_out["eps_floor"].mean().item())
+            opt_main.param_groups[0]["lr"] = LEARNING_RATE * lr_mult_val
+            _eps_end = eps_floor_val
+
+            opt_main.zero_grad()
+            loss_full.backward()
+            if main_grad_clip > 0.0:
+                nn.utils.clip_grad_norm_(
+                    list(q_net.linear_feature.parameters())
+                    + list(q_net.trunk.parameters())
+                    + list(q_net.head_full.parameters())
+                    + list(q_net.lstm_controller.parameters()),
+                    max_norm=main_grad_clip,
+                )
+            opt_main.step()
+
+            opt_aux.zero_grad()
+            (loss_cart + loss_pole).backward()
+            opt_aux.step()
+
+            loss_list.append(loss_full.item())
+
+            if t % LOG_EVERY == 0:
+                lstm_history.append({
+                    "step":           t,
+                    "episode":        len(episode_returns),
+                    "lr_mult_mean":   lr_mult_val,
+                    "eps_floor_mean": eps_floor_val,
+                    "k_cart_mean":    float(lstm_out["k_cart"].mean().item()),
+                    "k_pole_mean":    float(lstm_out["k_pole"].mean().item()),
+                })
+
+        if t % target_freq == 0:
+            t_net.load_state_dict(q_net.state_dict())
+
+        if (t + 1) % 100_000 == 0 or t == 0:
+            print(
+                f"  [lstm_ctrl] {label} step={t+1}/{total_timesteps}"
+                f"  ep={len(episode_returns)}"
+                f"  eps={_linear_schedule(START_E, _eps_end, int(_eps_decay), len(episode_returns)):.3f}",
+                flush=True,
+            )
+
+        t += 1
+
+    if total_episodes is not None and len(episode_returns) < total_episodes:
+        print(
+            f"  [lstm_ctrl] WARNING {label}: hit step cap {total_timesteps} "
+            f"with only {len(episode_returns)}/{total_episodes} episodes",
+            flush=True,
+        )
+
+    env.close()
+
+    last100 = (
+        float(np.mean(episode_returns[-100:]))
+        if len(episode_returns) >= 100
+        else float(np.mean(episode_returns)) if episode_returns else 0.0
+    )
+    print(
+        f"  Done [lstm_ctrl] {label}: ep={len(episode_returns)}"
+        f"  final={episode_returns[-1] if episode_returns else 0:.0f}"
+        f"  last100={last100:.1f}",
+        flush=True,
+    )
+
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = checkpoint_dir / f"b_feedb_cg_lstm_ctrl_seed{seed}.pt"
+        torch.save(
+            {
+                "algo":            "b_feedb_cg_lstm_ctrl",
+                "seed":            seed,
+                "episode_returns": episode_returns,
+                "lstm_history":    lstm_history,
+                "q_network":       q_net.state_dict(),
+            },
+            ckpt_path,
+        )
+        print(f"  Checkpoint: {ckpt_path}", flush=True)
+
+    return {
+        "seed":            seed,
+        "episode_returns": episode_returns,
+        "lstm_history":    lstm_history,
+        "last100_mean":    last100,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint helpers — modality 4
 # ---------------------------------------------------------------------------
 def _ckpt_path_rnn(ckpt_dir: Path, seed: int) -> Path:
@@ -972,6 +1693,692 @@ def _load_result_rnn(ckpt_dir: Path, seed: int) -> Dict:
         "seed":            seed,
         "episode_returns": ep,
         "rnn_history":     ckpt.get("rnn_history", []),
+        "last100_mean":    last100,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Training loop — modality 7 (LSTM controller with burn-in)
+# ---------------------------------------------------------------------------
+def run_one_lstm_burnin(
+    seed: int,
+    total_timesteps: int,
+    device: torch.device,
+    checkpoint_dir: Optional[Path] = None,
+    epsilon_decay_episodes: int = EPSILON_DECAY_EPISODES,
+    total_episodes: Optional[int] = None,
+    target_freq: int = TARGET_NETWORK_FREQ,
+    main_grad_clip: float = 10.0,
+    learning_starts: int = LEARNING_STARTS,
+    train_frequency: int = TRAIN_FREQUENCY,
+) -> Dict:
+    """Single-seed training for the LSTM controller with burn-in (modality 7).
+
+    Key differences from run_one_lstm:
+      1. Sequences of LSTM_SEQ_LEN transitions are stored together with the
+         initial (h0, c0) via LSTMBurnInBuffer.
+      2. At each training step, the first LSTM_BURN_IN steps of the sampled
+         sequence are used to re-warm (h, c) under torch.no_grad().
+      3. The TD loss is computed over the remaining LSTM_LEARN_LEN steps,
+         with BPTT flowing through all of them.
+      4. Episode boundaries inside a sequence zero out (h, c) before the
+         next step (both in burn-in and learning phases).
+
+    This eliminates the stale-hidden-state problem of single-step replay:
+    (h, c) used for the gradient computation are always consistent with the
+    current network weights.
+    """
+    _set_seed(seed)
+    env = gym.make("CartPole-v1")
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+
+    obs_dim   = int(np.prod(env.observation_space.shape))
+    n_actions = env.action_space.n
+    label     = f"seed={seed}"
+
+    q_net = BFeedbackLSTMControllerNetwork(obs_dim, n_actions).to(device)
+    t_net = BFeedbackLSTMControllerNetwork(obs_dim, n_actions).to(device)
+    t_net.load_state_dict(q_net.state_dict())
+
+    opt_main = optim.Adam(
+        list(q_net.linear_feature.parameters())
+        + list(q_net.trunk.parameters())
+        + list(q_net.head_full.parameters())
+        + list(q_net.lstm_controller.parameters()),
+        lr=LEARNING_RATE,
+    )
+    opt_aux = optim.Adam(
+        list(q_net.head_cart.parameters()) + list(q_net.head_pole.parameters()),
+        lr=LEARNING_RATE,
+    )
+
+    rb = LSTMBurnInBuffer(
+        LSTM_SEQ_BUFFER, env.observation_space.shape, RNN_HIDDEN, LSTM_SEQ_LEN, device
+    )
+
+    episode_returns: List[float] = []
+    lstm_history:   List[Dict]   = []
+
+    _eps_end   = END_E
+    _eps_decay = float(epsilon_decay_episodes)
+
+    h, c = q_net.zero_hidden(device)
+
+    # Sequence collector state
+    pend_obs:  List[np.ndarray] = []
+    pend_nxt:  List[np.ndarray] = []
+    pend_act:  List[int]        = []
+    pend_rew:  List[float]      = []
+    pend_done: List[float]      = []
+    seq_h0 = h.squeeze(0).cpu().numpy()
+    seq_c0 = c.squeeze(0).cpu().numpy()
+
+    def _flush_sequence() -> None:
+        """Store the pending sequence if it meets the minimum length."""
+        n = len(pend_obs)
+        if n < 2:          # too short to be useful
+            return
+        # Pad to SEQ_LEN with repeats of the last step (marked done)
+        obs_arr  = list(pend_obs)
+        nxt_arr  = list(pend_nxt)
+        act_arr  = list(pend_act)
+        rew_arr  = list(pend_rew)
+        done_arr = list(pend_done)
+        while len(obs_arr) < LSTM_SEQ_LEN:
+            obs_arr.append(obs_arr[-1])
+            nxt_arr.append(nxt_arr[-1])
+            act_arr.append(0)
+            rew_arr.append(0.0)
+            done_arr.append(1.0)   # padding is treated as done
+        rb.add(
+            np.array(obs_arr[:LSTM_SEQ_LEN],  dtype=np.float32),
+            np.array(nxt_arr[:LSTM_SEQ_LEN],  dtype=np.float32),
+            np.array(act_arr[:LSTM_SEQ_LEN],  dtype=np.int64),
+            np.array(rew_arr[:LSTM_SEQ_LEN],  dtype=np.float32),
+            np.array(done_arr[:LSTM_SEQ_LEN], dtype=np.float32),
+            seq_h0, seq_c0,
+        )
+
+    obs, _ = env.reset(seed=seed)
+    t = 0
+
+    while t < total_timesteps and (
+        total_episodes is None or len(episode_returns) < total_episodes
+    ):
+        # --- Rollout step ---
+        h_in_np = h.squeeze(0).cpu().numpy()
+        c_in_np = c.squeeze(0).cpu().numpy()
+
+        with torch.no_grad():
+            obs_t  = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            Q_act, h_next, c_next = q_net.forward_q_only(obs_t, h, c)
+        h = h_next.detach()
+        c = c_next.detach()
+
+        n_ep_done = len(episode_returns)
+        eps = _linear_schedule(START_E, _eps_end, int(_eps_decay), n_ep_done)
+        action = (
+            env.action_space.sample()
+            if random.random() < eps
+            else int(Q_act.argmax(dim=1).item())
+        )
+
+        next_obs, reward, terminated, truncated, infos = env.step(action)
+        done     = terminated or truncated
+        real_nxt = next_obs.copy()
+        if truncated and "final_observation" in infos:
+            real_nxt = infos["final_observation"]
+
+        pend_obs.append(obs.copy())
+        pend_nxt.append(real_nxt)
+        pend_act.append(action)
+        pend_rew.append(float(reward))
+        pend_done.append(float(done))
+
+        if "episode" in infos:
+            episode_returns.append(float(np.asarray(infos["episode"]["r"]).item()))
+
+        # Flush when sequence is full or episode ends
+        if len(pend_obs) == LSTM_SEQ_LEN or done:
+            _flush_sequence()
+            pend_obs.clear(); pend_nxt.clear()
+            pend_act.clear(); pend_rew.clear(); pend_done.clear()
+            if done:
+                h, c   = q_net.zero_hidden(device)
+                seq_h0 = np.zeros(RNN_HIDDEN, dtype=np.float32)
+                seq_c0 = np.zeros(RNN_HIDDEN, dtype=np.float32)
+            else:
+                seq_h0 = h.squeeze(0).cpu().numpy()
+                seq_c0 = c.squeeze(0).cpu().numpy()
+        if done:
+            obs, _ = env.reset()
+        else:
+            obs = next_obs
+
+        # --- Training step ---
+        if (t > learning_starts
+                and t % train_frequency == 0
+                and len(rb) >= LSTM_SEQ_BATCH):
+            data = rb.sample(LSTM_SEQ_BATCH)
+            # data.obs_seq:  (B, SEQ_LEN, obs_dim)
+            B = data.obs_seq.shape[0]
+
+            h_b = data.h0.clone()   # (B, RNN_HIDDEN)
+            c_b = data.c0.clone()
+
+            # ── Burn-in: re-warm (h, c) with current weights (no gradient) ──
+            with torch.no_grad():
+                for bt in range(LSTM_BURN_IN):
+                    obs_bt = data.obs_seq[:, bt]   # (B, obs_dim)
+                    _, _, _, _, h_b, c_b, _ = q_net.forward(obs_bt, h_b, c_b)
+                    # Zero out where step bt ended an episode
+                    if bt < LSTM_BURN_IN - 1:
+                        mask  = data.dones[:, bt].unsqueeze(1)   # (B, 1)
+                        h_b = h_b * (1.0 - mask)
+                        c_b = c_b * (1.0 - mask)
+
+            h_b = h_b.detach()
+            c_b = c_b.detach()
+
+            # ── Learning: compute TD loss over LEARN steps (with BPTT) ──────
+            loss_full_sum = torch.zeros(1, device=device)
+            loss_cart_sum = torch.zeros(1, device=device)
+            loss_pole_sum = torch.zeros(1, device=device)
+            lstm_out_last: Dict[str, torch.Tensor] = {}
+
+            for lt in range(LSTM_LEARN_LEN):
+                st = LSTM_BURN_IN + lt          # index in full sequence
+
+                # Reset where previous step ended an episode
+                if lt > 0:
+                    mask  = data.dones[:, st - 1].unsqueeze(1)
+                    h_b = h_b * (1.0 - mask)
+                    c_b = c_b * (1.0 - mask)
+
+                obs_st      = data.obs_seq[:, st]          # (B, obs_dim)
+                next_obs_st = data.next_obs_seq[:, st]
+                acts_st     = data.actions[:, st].unsqueeze(1)   # (B, 1)
+                rews_st     = data.rewards[:, st]
+                done_st     = data.dones[:, st]
+
+                # Frozen target (use zeroed h for simplicity, like other modalities)
+                with torch.no_grad():
+                    h_tgt = torch.zeros_like(h_b)
+                    c_tgt = torch.zeros_like(c_b)
+                    tQ_full, tQ_cart, tQ_pole, _, _, _, _ = t_net.forward(
+                        next_obs_st, h_tgt, c_tgt
+                    )
+                    y_full = rews_st + GAMMA * (1.0 - done_st) * tQ_full.max(dim=1).values
+                    y_cart = rews_st + GAMMA * (1.0 - done_st) * tQ_cart.max(dim=1).values
+                    y_pole = rews_st + GAMMA * (1.0 - done_st) * tQ_pole.max(dim=1).values
+
+                Q_full, Q_cart, Q_pole, _, h_b, c_b, lstm_out_last = q_net.forward(
+                    obs_st, h_b, c_b
+                )
+
+                qf_sa = Q_full.gather(1, acts_st).squeeze()
+                qc_sa = Q_cart.gather(1, acts_st).squeeze()
+                qp_sa = Q_pole.gather(1, acts_st).squeeze()
+
+                loss_full_sum = loss_full_sum + F.mse_loss(y_full, qf_sa)
+                loss_cart_sum = loss_cart_sum + F.mse_loss(y_cart, qc_sa)
+                loss_pole_sum = loss_pole_sum + F.mse_loss(y_pole, qp_sa)
+
+            loss_full = loss_full_sum / LSTM_LEARN_LEN
+            loss_cart = loss_cart_sum / LSTM_LEARN_LEN
+            loss_pole = loss_pole_sum / LSTM_LEARN_LEN
+
+            lr_mult_val   = float(lstm_out_last["lr_mult"].mean().item())   if lstm_out_last else 1.0
+            eps_floor_val = float(lstm_out_last["eps_floor"].mean().item()) if lstm_out_last else END_E
+            opt_main.param_groups[0]["lr"] = LEARNING_RATE * lr_mult_val
+            _eps_end = eps_floor_val
+
+            opt_main.zero_grad()
+            loss_full.backward()
+            if main_grad_clip > 0.0:
+                nn.utils.clip_grad_norm_(
+                    list(q_net.linear_feature.parameters())
+                    + list(q_net.trunk.parameters())
+                    + list(q_net.head_full.parameters())
+                    + list(q_net.lstm_controller.parameters()),
+                    max_norm=main_grad_clip,
+                )
+            opt_main.step()
+
+            opt_aux.zero_grad()
+            (loss_cart + loss_pole).backward()
+            opt_aux.step()
+
+            if t % LOG_EVERY == 0 and lstm_out_last:
+                lstm_history.append({
+                    "step":           t,
+                    "episode":        len(episode_returns),
+                    "lr_mult_mean":   lr_mult_val,
+                    "eps_floor_mean": eps_floor_val,
+                    "k_cart_mean":    float(lstm_out_last["k_cart"].mean().item()),
+                    "k_pole_mean":    float(lstm_out_last["k_pole"].mean().item()),
+                })
+
+        if t % target_freq == 0:
+            t_net.load_state_dict(q_net.state_dict())
+
+        if (t + 1) % 100_000 == 0 or t == 0:
+            print(
+                f"  [lstm_bi] {label} step={t+1}/{total_timesteps}"
+                f"  ep={len(episode_returns)}"
+                f"  seqs={len(rb)}"
+                f"  eps={_linear_schedule(START_E, _eps_end, int(_eps_decay), len(episode_returns)):.3f}",
+                flush=True,
+            )
+
+        t += 1
+
+    if total_episodes is not None and len(episode_returns) < total_episodes:
+        print(
+            f"  [lstm_bi] WARNING {label}: hit step cap {total_timesteps} "
+            f"with only {len(episode_returns)}/{total_episodes} episodes",
+            flush=True,
+        )
+
+    env.close()
+
+    last100 = (
+        float(np.mean(episode_returns[-100:]))
+        if len(episode_returns) >= 100
+        else float(np.mean(episode_returns)) if episode_returns else 0.0
+    )
+    print(
+        f"  Done [lstm_bi] {label}: ep={len(episode_returns)}"
+        f"  final={episode_returns[-1] if episode_returns else 0:.0f}"
+        f"  last100={last100:.1f}",
+        flush=True,
+    )
+
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = checkpoint_dir / f"b_feedb_cg_lstm_bi_seed{seed}.pt"
+        torch.save(
+            {
+                "algo":            "b_feedb_cg_lstm_bi",
+                "seed":            seed,
+                "episode_returns": episode_returns,
+                "lstm_history":    lstm_history,
+                "q_network":       q_net.state_dict(),
+            },
+            ckpt_path,
+        )
+        print(f"  Checkpoint: {ckpt_path}", flush=True)
+
+    return {
+        "seed":            seed,
+        "episode_returns": episode_returns,
+        "lstm_history":    lstm_history,
+        "last100_mean":    last100,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Training loop — GRU controller with burn-in
+# ---------------------------------------------------------------------------
+def run_one_gru_burnin(
+    seed: int,
+    total_timesteps: int,
+    device: torch.device,
+    checkpoint_dir: Optional[Path] = None,
+    epsilon_decay_episodes: int = EPSILON_DECAY_EPISODES,
+    total_episodes: Optional[int] = None,
+    target_freq: int = TARGET_NETWORK_FREQ,
+    main_grad_clip: float = 10.0,
+    learning_starts: int = LEARNING_STARTS,
+    train_frequency: int = TRAIN_FREQUENCY,
+) -> Dict:
+    """Single-seed training for the GRU controller with burn-in.
+
+    Uses the same BFeedbackRNNControllerNetwork (GRUCell backbone) as
+    run_one_rnn, but replaces single-transition replay with sequence replay:
+
+      • GRUBurnInBuffer stores sequences of LSTM_SEQ_LEN (20) consecutive
+        transitions together with the GRU hidden state h0 at the start of
+        each sequence.
+      • At each training step, the first LSTM_BURN_IN (10) steps re-warm h
+        under torch.no_grad() using the current weights (fixing the
+        stale-hidden-state problem of the standard GRU modality).
+      • The remaining LSTM_LEARN_LEN (10) steps accumulate the TD loss;
+        BPTT flows through all of them into the GRU controller.
+      • Episode boundaries inside a sequence zero h before the next step.
+    """
+    _set_seed(seed)
+    env = gym.make("CartPole-v1")
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+
+    obs_dim   = int(np.prod(env.observation_space.shape))
+    n_actions = env.action_space.n
+    label     = f"seed={seed}"
+
+    q_net = BFeedbackRNNControllerNetwork(obs_dim, n_actions).to(device)
+    t_net = BFeedbackRNNControllerNetwork(obs_dim, n_actions).to(device)
+    t_net.load_state_dict(q_net.state_dict())
+
+    opt_main = optim.Adam(
+        list(q_net.linear_feature.parameters())
+        + list(q_net.trunk.parameters())
+        + list(q_net.head_full.parameters())
+        + list(q_net.rnn_controller.parameters()),
+        lr=LEARNING_RATE,
+    )
+    opt_aux = optim.Adam(
+        list(q_net.head_cart.parameters()) + list(q_net.head_pole.parameters()),
+        lr=LEARNING_RATE,
+    )
+
+    rb = GRUBurnInBuffer(
+        LSTM_SEQ_BUFFER, env.observation_space.shape, RNN_HIDDEN, LSTM_SEQ_LEN, device
+    )
+
+    episode_returns: List[float] = []
+    rnn_history:    List[Dict]   = []
+
+    _eps_end   = END_E
+    _eps_decay = float(epsilon_decay_episodes)
+
+    h = q_net.zero_hidden(device)   # (1, RNN_HIDDEN)
+
+    # Sequence collector
+    pend_obs:  List[np.ndarray] = []
+    pend_nxt:  List[np.ndarray] = []
+    pend_act:  List[int]        = []
+    pend_rew:  List[float]      = []
+    pend_done: List[float]      = []
+    seq_h0 = h.squeeze(0).cpu().numpy()
+
+    def _flush_sequence() -> None:
+        n = len(pend_obs)
+        if n < 2:
+            return
+        obs_arr  = list(pend_obs);  nxt_arr  = list(pend_nxt)
+        act_arr  = list(pend_act);  rew_arr  = list(pend_rew)
+        done_arr = list(pend_done)
+        while len(obs_arr) < LSTM_SEQ_LEN:
+            obs_arr.append(obs_arr[-1]);  nxt_arr.append(nxt_arr[-1])
+            act_arr.append(0);            rew_arr.append(0.0)
+            done_arr.append(1.0)
+        rb.add(
+            np.array(obs_arr[:LSTM_SEQ_LEN],  dtype=np.float32),
+            np.array(nxt_arr[:LSTM_SEQ_LEN],  dtype=np.float32),
+            np.array(act_arr[:LSTM_SEQ_LEN],  dtype=np.int64),
+            np.array(rew_arr[:LSTM_SEQ_LEN],  dtype=np.float32),
+            np.array(done_arr[:LSTM_SEQ_LEN], dtype=np.float32),
+            seq_h0,
+        )
+
+    obs, _ = env.reset(seed=seed)
+    t = 0
+
+    while t < total_timesteps and (
+        total_episodes is None or len(episode_returns) < total_episodes
+    ):
+        h_in_np = h.squeeze(0).cpu().numpy()
+
+        with torch.no_grad():
+            obs_t  = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            Q_act, h_next = q_net.forward_q_only(obs_t, h)
+        h = h_next.detach()
+
+        n_ep_done = len(episode_returns)
+        eps = _linear_schedule(START_E, _eps_end, int(_eps_decay), n_ep_done)
+        action = (
+            env.action_space.sample()
+            if random.random() < eps
+            else int(Q_act.argmax(dim=1).item())
+        )
+
+        next_obs, reward, terminated, truncated, infos = env.step(action)
+        done     = terminated or truncated
+        real_nxt = next_obs.copy()
+        if truncated and "final_observation" in infos:
+            real_nxt = infos["final_observation"]
+
+        pend_obs.append(obs.copy());   pend_nxt.append(real_nxt)
+        pend_act.append(action);       pend_rew.append(float(reward))
+        pend_done.append(float(done))
+
+        if "episode" in infos:
+            episode_returns.append(float(np.asarray(infos["episode"]["r"]).item()))
+
+        if len(pend_obs) == LSTM_SEQ_LEN or done:
+            _flush_sequence()
+            pend_obs.clear(); pend_nxt.clear()
+            pend_act.clear(); pend_rew.clear(); pend_done.clear()
+            if done:
+                h      = q_net.zero_hidden(device)
+                seq_h0 = np.zeros(RNN_HIDDEN, dtype=np.float32)
+            else:
+                seq_h0 = h.squeeze(0).cpu().numpy()
+        if done:
+            obs, _ = env.reset()
+        else:
+            obs = next_obs
+
+        # --- Training step ---
+        if (t > learning_starts
+                and t % train_frequency == 0
+                and len(rb) >= LSTM_SEQ_BATCH):
+            data = rb.sample(LSTM_SEQ_BATCH)
+            B = data.obs_seq.shape[0]
+
+            h_b = data.h0.clone()   # (B, RNN_HIDDEN)
+
+            # ── Burn-in: re-warm h with current weights (no gradient) ──────
+            with torch.no_grad():
+                for bt in range(LSTM_BURN_IN):
+                    obs_bt = data.obs_seq[:, bt]
+                    _, _, _, _, h_b, _ = q_net.forward(obs_bt, h_b, detach_k=True)
+                    if bt < LSTM_BURN_IN - 1:
+                        mask = data.dones[:, bt].unsqueeze(1)
+                        h_b  = h_b * (1.0 - mask)
+
+            h_b = h_b.detach()
+
+            # ── Learning: TD loss over LEARN steps, BPTT through GRU ────────
+            # detach_k=True: k_cart/k_pole are detached so the multi-step
+            # BPTT gradient does NOT flow through the gate path (prevents
+            # gradient explosion from the 10-step BPTT chain).
+            loss_full_sum = torch.zeros(1, device=device)
+            loss_cart_sum = torch.zeros(1, device=device)
+            loss_pole_sum = torch.zeros(1, device=device)
+            rnn_out_last: Dict[str, torch.Tensor] = {}
+
+            for lt in range(LSTM_LEARN_LEN):
+                st = LSTM_BURN_IN + lt
+                if lt > 0:
+                    mask = data.dones[:, st - 1].unsqueeze(1)
+                    h_b  = h_b * (1.0 - mask)
+
+                obs_st      = data.obs_seq[:, st]
+                next_obs_st = data.next_obs_seq[:, st]
+                acts_st     = data.actions[:, st].unsqueeze(1)
+                rews_st     = data.rewards[:, st]
+                done_st     = data.dones[:, st]
+
+                with torch.no_grad():
+                    h_tgt = torch.zeros_like(h_b)
+                    tQ_full, tQ_cart, tQ_pole, _, _, _ = t_net.forward(
+                        next_obs_st, h_tgt, detach_k=True
+                    )
+                    y_full = rews_st + GAMMA * (1.0 - done_st) * tQ_full.max(dim=1).values
+                    y_cart = rews_st + GAMMA * (1.0 - done_st) * tQ_cart.max(dim=1).values
+                    y_pole = rews_st + GAMMA * (1.0 - done_st) * tQ_pole.max(dim=1).values
+
+                Q_full, Q_cart, Q_pole, _, h_b, rnn_out_last = q_net.forward(
+                    obs_st, h_b, detach_k=True
+                )
+
+                qf_sa = Q_full.gather(1, acts_st).squeeze()
+                qc_sa = Q_cart.gather(1, acts_st).squeeze()
+                qp_sa = Q_pole.gather(1, acts_st).squeeze()
+
+                loss_full_sum = loss_full_sum + F.mse_loss(y_full, qf_sa)
+                loss_cart_sum = loss_cart_sum + F.mse_loss(y_cart, qc_sa)
+                loss_pole_sum = loss_pole_sum + F.mse_loss(y_pole, qp_sa)
+
+            loss_full = loss_full_sum / LSTM_LEARN_LEN
+            loss_cart = loss_cart_sum / LSTM_LEARN_LEN
+            loss_pole = loss_pole_sum / LSTM_LEARN_LEN
+
+            lr_mult_val   = float(rnn_out_last["lr_mult"].mean().item())   if rnn_out_last else 1.0
+            eps_floor_val = float(rnn_out_last["eps_floor"].mean().item()) if rnn_out_last else END_E
+            opt_main.param_groups[0]["lr"] = LEARNING_RATE * lr_mult_val
+            _eps_end = eps_floor_val
+
+            opt_main.zero_grad()
+            loss_full.backward()
+            if main_grad_clip > 0.0:
+                nn.utils.clip_grad_norm_(
+                    list(q_net.linear_feature.parameters())
+                    + list(q_net.trunk.parameters())
+                    + list(q_net.head_full.parameters())
+                    + list(q_net.rnn_controller.parameters()),
+                    max_norm=main_grad_clip,
+                )
+            opt_main.step()
+
+            opt_aux.zero_grad()
+            (loss_cart + loss_pole).backward()
+            opt_aux.step()
+
+            if t % LOG_EVERY == 0 and rnn_out_last:
+                rnn_history.append({
+                    "step":           t,
+                    "episode":        len(episode_returns),
+                    "lr_mult_mean":   lr_mult_val,
+                    "eps_floor_mean": eps_floor_val,
+                    "k_cart_mean":    float(rnn_out_last["k_cart"].mean().item()),
+                    "k_pole_mean":    float(rnn_out_last["k_pole"].mean().item()),
+                })
+
+        if t % target_freq == 0:
+            t_net.load_state_dict(q_net.state_dict())
+
+        if (t + 1) % 100_000 == 0 or t == 0:
+            print(
+                f"  [gru_bi] {label} step={t+1}/{total_timesteps}"
+                f"  ep={len(episode_returns)}"
+                f"  seqs={len(rb)}"
+                f"  eps={_linear_schedule(START_E, _eps_end, int(_eps_decay), len(episode_returns)):.3f}",
+                flush=True,
+            )
+
+        t += 1
+
+    if total_episodes is not None and len(episode_returns) < total_episodes:
+        print(
+            f"  [gru_bi] WARNING {label}: hit step cap {total_timesteps} "
+            f"with only {len(episode_returns)}/{total_episodes} episodes",
+            flush=True,
+        )
+
+    env.close()
+
+    last100 = (
+        float(np.mean(episode_returns[-100:]))
+        if len(episode_returns) >= 100
+        else float(np.mean(episode_returns)) if episode_returns else 0.0
+    )
+    print(
+        f"  Done [gru_bi] {label}: ep={len(episode_returns)}"
+        f"  final={episode_returns[-1] if episode_returns else 0:.0f}"
+        f"  last100={last100:.1f}",
+        flush=True,
+    )
+
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = checkpoint_dir / f"b_feedb_cg_gru_bi_seed{seed}.pt"
+        torch.save(
+            {
+                "algo":            "b_feedb_cg_gru_bi",
+                "seed":            seed,
+                "episode_returns": episode_returns,
+                "rnn_history":     rnn_history,
+                "q_network":       q_net.state_dict(),
+            },
+            ckpt_path,
+        )
+        print(f"  Checkpoint: {ckpt_path}", flush=True)
+
+    return {
+        "seed":            seed,
+        "episode_returns": episode_returns,
+        "rnn_history":     rnn_history,
+        "last100_mean":    last100,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers — GRU burn-in
+# ---------------------------------------------------------------------------
+def _ckpt_path_gru_burnin(ckpt_dir: Path, seed: int) -> Path:
+    return ckpt_dir / f"b_feedb_cg_gru_bi_seed{seed}.pt"
+
+
+def _load_result_gru_burnin(ckpt_dir: Path, seed: int) -> Dict:
+    path = _ckpt_path_gru_burnin(ckpt_dir, seed)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ep   = ckpt["episode_returns"]
+    last100 = (
+        float(np.mean(ep[-100:])) if len(ep) >= 100
+        else float(np.mean(ep)) if ep else 0.0
+    )
+    return {
+        "seed":            seed,
+        "episode_returns": ep,
+        "rnn_history":     ckpt.get("rnn_history", []),
+        "last100_mean":    last100,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers — modality 5 (LSTM controller)
+# ---------------------------------------------------------------------------
+def _ckpt_path_lstm(ckpt_dir: Path, seed: int) -> Path:
+    return ckpt_dir / f"b_feedb_cg_lstm_ctrl_seed{seed}.pt"
+
+
+def _load_result_lstm(ckpt_dir: Path, seed: int) -> Dict:
+    path = _ckpt_path_lstm(ckpt_dir, seed)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ep   = ckpt["episode_returns"]
+    last100 = (
+        float(np.mean(ep[-100:])) if len(ep) >= 100
+        else float(np.mean(ep)) if ep else 0.0
+    )
+    return {
+        "seed":            seed,
+        "episode_returns": ep,
+        "lstm_history":    ckpt.get("lstm_history", []),
+        "last100_mean":    last100,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers — modality 7 (LSTM burn-in)
+# ---------------------------------------------------------------------------
+def _ckpt_path_lstm_burnin(ckpt_dir: Path, seed: int) -> Path:
+    return ckpt_dir / f"b_feedb_cg_lstm_bi_seed{seed}.pt"
+
+
+def _load_result_lstm_burnin(ckpt_dir: Path, seed: int) -> Dict:
+    path = _ckpt_path_lstm_burnin(ckpt_dir, seed)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ep   = ckpt["episode_returns"]
+    last100 = (
+        float(np.mean(ep[-100:])) if len(ep) >= 100
+        else float(np.mean(ep)) if ep else 0.0
+    )
+    return {
+        "seed":            seed,
+        "episode_returns": ep,
+        "lstm_history":    ckpt.get("lstm_history", []),
         "last100_mean":    last100,
     }
 
@@ -1029,8 +2436,11 @@ def plot_fourway_comparison(
     n_seeds: int,
     decay_tag: str,
     n_ep: Optional[int] = None,
+    gru_bi_results:  Optional[List[Dict]] = None,
+    lstm_results:    Optional[List[Dict]] = None,
+    lstm_bi_results: Optional[List[Dict]] = None,
 ) -> None:
-    """Four-curve learning figure with ±1 std shading.  Missing modalities are skipped."""
+    """Multi-curve learning figure with ±1 std shading.  Missing modalities are skipped."""
 
     def _prep(results: List[Dict]):
         if not results:
@@ -1046,18 +2456,22 @@ def plot_fourway_comparison(
         ep = np.arange(1, n + 1)
         return ep[W - 1:], _smooth(mu, W), _smooth(sd, W)
 
-    def _l100(results: List[Dict]) -> float:
+    def _l100(results: Optional[List[Dict]]) -> float:
         return float(np.mean([r["last100_mean"] for r in results])) if results else 0.0
 
     curves = [
-        (_prep(base_results),  COLOR_BASE,  f"baseline           last-100: {_l100(base_results):.1f}"),
-        (_prep(gate_results),  COLOR_GATE,  f"analytical gate    last-100: {_l100(gate_results):.1f}"),
-        (_prep(learn_results), COLOR_LEARN, f"learnable gate     last-100: {_l100(learn_results):.1f}"),
-        (_prep(rnn_results),   COLOR_RNN,   f"RNN controller     last-100: {_l100(rnn_results):.1f}"),
+        (_prep(base_results),              COLOR_BASE,    f"baseline              last-100: {_l100(base_results):.1f}"),
+        (_prep(gate_results),              COLOR_GATE,    f"analytical gate       last-100: {_l100(gate_results):.1f}"),
+        (_prep(learn_results),             COLOR_LEARN,   f"learnable gate        last-100: {_l100(learn_results):.1f}"),
+        (_prep(rnn_results),               COLOR_RNN,     f"GRU controller        last-100: {_l100(rnn_results):.1f}"),
+        (_prep(gru_bi_results  or []),     COLOR_GRU_BI,  f"GRU + burn-in         last-100: {_l100(gru_bi_results  or []):.1f}"),
+        (_prep(lstm_results    or []),     COLOR_LSTM,    f"LSTM controller       last-100: {_l100(lstm_results    or []):.1f}"),
+        (_prep(lstm_bi_results or []),     COLOR_LSTM_BI, f"LSTM + burn-in        last-100: {_l100(lstm_bi_results or []):.1f}"),
     ]
 
-    ep_str = f"{n_ep:,} ep" if n_ep else decay_tag
-    fig, ax = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
+    n_active = sum(1 for (ep, _, _), _, _ in curves if len(ep) > 0)
+    ep_str   = f"{n_ep:,} ep" if n_ep else decay_tag
+    fig, ax  = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
 
     for (ep, sm, sd), col, lbl in curves:
         if len(ep) == 0:
@@ -1069,7 +2483,7 @@ def plot_fourway_comparison(
     ax.set_xlabel("Episode", fontsize=12)
     ax.set_ylabel("Episodic return", fontsize=12)
     ax.set_title(
-        f"Four-way gate comparison  ({n_seeds} seed(s), {ep_str}, ±1 std)",
+        f"Gate comparison ({n_active}-way, {n_seeds} seed(s), {ep_str}, ±1 std)",
         fontsize=11,
     )
     ax.legend(loc="lower right", fontsize=9)
@@ -1086,11 +2500,18 @@ def plot_rnn_controller_history(
     rnn_results: List[Dict],
     out_jpg: Path,
 ) -> None:
-    """2×2 panel showing mean RNN controller outputs over training (±1 std)."""
-    histories = [r.get("rnn_history", []) for r in rnn_results]
+    """2×2 panel showing mean controller outputs over training (±1 std).
+
+    Works for both GRU (key: rnn_history) and LSTM (key: lstm_history) results
+    by checking both keys.
+    """
+    histories = [
+        r.get("rnn_history") or r.get("lstm_history") or []
+        for r in rnn_results
+    ]
     histories = [h for h in histories if h]
     if not histories:
-        print("  No rnn_history to plot; skipping.", flush=True)
+        print("  No controller history to plot; skipping.", flush=True)
         return
 
     ref_steps = [h["step"] for h in histories[0]]
@@ -1497,6 +2918,72 @@ def main() -> None:
                 print(">>> [RNN_REINFORCE] All checkpoints present, skipping.",
                       flush=True)
 
+        # Modality 6 — GRU controller with burn-in
+        if "gru_burnin" in modalities:
+            seeds_run = (
+                [s for s in seeds if not _ckpt_path_gru_burnin(ckpt_dir, s).exists()]
+                if args.train_missing_only else list(seeds)
+            )
+            if seeds_run:
+                print(f"\n>>> [GRU_BURNIN] Training seeds {seeds_run} ...", flush=True)
+                t0 = time.perf_counter()
+                for seed in seeds_run:
+                    run_one_gru_burnin(
+                        seed, n_step, device,
+                        checkpoint_dir=ckpt_dir,
+                        epsilon_decay_episodes=eps_decay,
+                        total_episodes=n_ep_tgt,
+                        learning_starts=l_starts,
+                        train_frequency=t_freq,
+                    )
+                print(f">>> [GRU_BURNIN] Done in {time.perf_counter()-t0:.1f}s", flush=True)
+            else:
+                print(">>> [GRU_BURNIN] All checkpoints present, skipping.", flush=True)
+
+        # Modality 7 — LSTM controller
+        if "lstm" in modalities:
+            seeds_run = (
+                [s for s in seeds if not _ckpt_path_lstm(ckpt_dir, s).exists()]
+                if args.train_missing_only else list(seeds)
+            )
+            if seeds_run:
+                print(f"\n>>> [LSTM] Training seeds {seeds_run} ...", flush=True)
+                t0 = time.perf_counter()
+                for seed in seeds_run:
+                    run_one_lstm(
+                        seed, n_step, device,
+                        checkpoint_dir=ckpt_dir,
+                        epsilon_decay_episodes=eps_decay,
+                        total_episodes=n_ep_tgt,
+                        learning_starts=l_starts,
+                        train_frequency=t_freq,
+                    )
+                print(f">>> [LSTM] Done in {time.perf_counter()-t0:.1f}s", flush=True)
+            else:
+                print(">>> [LSTM] All checkpoints present, skipping.", flush=True)
+
+        # Modality 7 — LSTM controller with burn-in
+        if "lstm_burnin" in modalities:
+            seeds_run = (
+                [s for s in seeds if not _ckpt_path_lstm_burnin(ckpt_dir, s).exists()]
+                if args.train_missing_only else list(seeds)
+            )
+            if seeds_run:
+                print(f"\n>>> [LSTM_BURNIN] Training seeds {seeds_run} ...", flush=True)
+                t0 = time.perf_counter()
+                for seed in seeds_run:
+                    run_one_lstm_burnin(
+                        seed, n_step, device,
+                        checkpoint_dir=ckpt_dir,
+                        epsilon_decay_episodes=eps_decay,
+                        total_episodes=n_ep_tgt,
+                        learning_starts=l_starts,
+                        train_frequency=t_freq,
+                    )
+                print(f">>> [LSTM_BURNIN] Done in {time.perf_counter()-t0:.1f}s", flush=True)
+            else:
+                print(">>> [LSTM_BURNIN] All checkpoints present, skipping.", flush=True)
+
     # ------------------------------------------------------------------ #
     # Verify checkpoints present                                         #
     # ------------------------------------------------------------------ #
@@ -1523,6 +3010,18 @@ def main() -> None:
                     for s in seeds
                     if not _ckpt_path_rnn_reinforce(
                         rf_ckpt_dir, s, n_ep_tgt or 0).exists()]
+    if "gru_burnin"    in modalities:
+        missing += [_ckpt_path_gru_burnin(ckpt_dir, s)
+                    for s in seeds
+                    if not _ckpt_path_gru_burnin(ckpt_dir, s).exists()]
+    if "lstm"          in modalities:
+        missing += [_ckpt_path_lstm(ckpt_dir, s)
+                    for s in seeds
+                    if not _ckpt_path_lstm(ckpt_dir, s).exists()]
+    if "lstm_burnin"   in modalities:
+        missing += [_ckpt_path_lstm_burnin(ckpt_dir, s)
+                    for s in seeds
+                    if not _ckpt_path_lstm_burnin(ckpt_dir, s).exists()]
     if missing:
         for m in missing:
             print(f"  MISSING: {m}", flush=True)
@@ -1531,17 +3030,23 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Load results                                                        #
     # ------------------------------------------------------------------ #
-    base_res  = ([cg_analytical._load_result(ckpt_dir, s, False)    for s in seeds]
-                 if "baseline"      in modalities else [])
-    gate_res  = ([cg_analytical._load_result(ckpt_dir, s, True)     for s in seeds]
-                 if "analytical"    in modalities else [])
-    learn_res = ([cg_learnable._load_result_learnable(ckpt_dir, s)  for s in seeds]
-                 if "learnable"     in modalities else [])
-    rnn_res   = ([_load_result_rnn(ckpt_dir, s)                     for s in seeds]
-                 if "rnn"           in modalities else [])
-    rnn_rf_res = ([_load_result_rnn_reinforce(rf_ckpt_dir, s, n_ep_tgt or 0)
-                   for s in seeds]
-                  if "rnn_reinforce" in modalities else [])
+    base_res    = ([cg_analytical._load_result(ckpt_dir, s, False)    for s in seeds]
+                   if "baseline"      in modalities else [])
+    gate_res    = ([cg_analytical._load_result(ckpt_dir, s, True)     for s in seeds]
+                   if "analytical"    in modalities else [])
+    learn_res   = ([cg_learnable._load_result_learnable(ckpt_dir, s)  for s in seeds]
+                   if "learnable"     in modalities else [])
+    rnn_res     = ([_load_result_rnn(ckpt_dir, s)                     for s in seeds]
+                   if "rnn"           in modalities else [])
+    rnn_rf_res  = ([_load_result_rnn_reinforce(rf_ckpt_dir, s, n_ep_tgt or 0)
+                    for s in seeds]
+                   if "rnn_reinforce" in modalities else [])
+    gru_bi_res  = ([_load_result_gru_burnin(ckpt_dir, s)  for s in seeds]
+                   if "gru_burnin"    in modalities else [])
+    lstm_res    = ([_load_result_lstm(ckpt_dir, s)         for s in seeds]
+                   if "lstm"          in modalities else [])
+    lstm_bi_res = ([_load_result_lstm_burnin(ckpt_dir, s)  for s in seeds]
+                   if "lstm_burnin"   in modalities else [])
 
     # ------------------------------------------------------------------ #
     # Summary                                                             #
@@ -1550,8 +3055,11 @@ def main() -> None:
     if base_res:    _agg_print(base_res,    "baseline")
     if gate_res:    _agg_print(gate_res,    "analytical gate")
     if learn_res:   _agg_print(learn_res,   "learnable gate")
-    if rnn_res:     _agg_print(rnn_res,     "RNN controller (direct grad)")
+    if rnn_res:     _agg_print(rnn_res,     "GRU controller (direct grad)")
+    if gru_bi_res:  _agg_print(gru_bi_res,  "GRU + burn-in")
     if rnn_rf_res:  _agg_print(rnn_rf_res,  "RNN controller (REINFORCE)")
+    if lstm_res:    _agg_print(lstm_res,    "LSTM controller")
+    if lstm_bi_res: _agg_print(lstm_bi_res, "LSTM + burn-in")
 
     # ------------------------------------------------------------------ #
     # Figures                                                             #
@@ -1566,12 +3074,30 @@ def main() -> None:
         n_seeds=len(seeds),
         decay_tag=decay_tag,
         n_ep=n_ep_tgt,
+        gru_bi_results=gru_bi_res   or None,
+        lstm_results=lstm_res       or None,
+        lstm_bi_results=lstm_bi_res or None,
     )
 
     if rnn_res:
         plot_rnn_controller_history(
             rnn_res,
             FIG_DIR / f"rnn_ctrl_history_{n_str}_{decay_tag}{fast_sfx}{ep_tag}.jpg",
+        )
+    if gru_bi_res:
+        plot_rnn_controller_history(
+            gru_bi_res,
+            FIG_DIR / f"gru_bi_ctrl_history_{n_str}_{decay_tag}{fast_sfx}{ep_tag}.jpg",
+        )
+    if lstm_res:
+        plot_rnn_controller_history(
+            lstm_res,
+            FIG_DIR / f"lstm_ctrl_history_{n_str}_{decay_tag}{fast_sfx}{ep_tag}.jpg",
+        )
+    if lstm_bi_res:
+        plot_rnn_controller_history(
+            lstm_bi_res,
+            FIG_DIR / f"lstm_bi_ctrl_history_{n_str}_{decay_tag}{fast_sfx}{ep_tag}.jpg",
         )
 
 

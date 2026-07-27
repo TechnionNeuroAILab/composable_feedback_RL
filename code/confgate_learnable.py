@@ -114,7 +114,7 @@ class ReplayBuffer:
 
 
 # ---------------------------------------------------------------------------
-# Learnable gate parameters (items 1–12; Z-norm eps fixed at 1e-8)
+# Learnable gate parameters (items 1–14; Z-norm eps fixed at 1e-8)
 # ---------------------------------------------------------------------------
 
 Z_NORM_EPS = 1e-8
@@ -130,15 +130,26 @@ class LearnableGateParams(nn.Module):
       3    : softmax temperature      (stored as log; softplus'd in usage)
       4,12 : trunk_scale_base, trunk_m_slope
       5    : m_divisor                (control signal normalisation)
-      6–7  : lr_floor, lr_slope       (effective LR = LR*(floor+slope*m))
+      6–7  : lr_floor, lr_slope       (effective LR = LR*(floor+slope*m); clamped in usage)
       8    : eps_bump                 (exploration floor raise when m is low)
       9–11 : ctrl_kmin_{cap,base,slope} (dynamic k_min formula)
+      13   : train_frequency           (env steps between gradient updates; log-space)
+      14   : target_frequency          (env steps between target-net syncs; log-space)
+
+    Freq m-coupling (freq_formula selects one):
+      F1 : tf_{floor,slope}, tgt_{floor,slope}  — scale = floor + slope*m (sigmoid-bounded)
+      F2 : tf_{cap,base,slope}, tgt_{cap,base,slope} — scale = min(cap, base + slope*m)
+      F3 : alpha_tf, alpha_tgt — freq_soft = exp(log_freq + alpha*m)
 
     Z-norm stability eps is hard-coded to Z_NORM_EPS (= 1e-8), same as analytical.
     """
 
-    def __init__(self):
+    def __init__(self, freq_formula: int = 3, stable_gate: bool = False):
         super().__init__()
+        self.freq_formula = int(freq_formula)
+        self.stable_gate  = bool(stable_gate)
+        if self.freq_formula not in (1, 2, 3):
+            raise ValueError(f"freq_formula must be 1, 2, or 3; got {freq_formula}")
         # 1, 2: gate range
         self.gate_k_min  = nn.Parameter(torch.tensor(0.8))
         self.gate_k_max  = nn.Parameter(torch.tensor(1.0))
@@ -149,15 +160,33 @@ class LearnableGateParams(nn.Module):
         self.trunk_m_slope   = nn.Parameter(torch.tensor(0.0))
         # 5: m_divisor (must stay > 0; clamped in usage)
         self.m_divisor   = nn.Parameter(torch.tensor(2.0))
-        # 6–7: effective LR = LEARNING_RATE * (lr_floor + lr_slope * m)
-        self.lr_floor    = nn.Parameter(torch.tensor(0.5))
-        self.lr_slope    = nn.Parameter(torch.tensor(0.5))
+        # 6–7: lr_floor, lr_slope — direct learnable scalars; clamped in getters
+        self.lr_floor = nn.Parameter(torch.tensor(0.5))
+        self.lr_slope = nn.Parameter(torch.tensor(0.5))
         # 8: eps_end = END_E + (1-m) * eps_bump
         self.eps_bump    = nn.Parameter(torch.tensor(0.05))
         # 9–11: k_min_eff = min(cap, base + slope * m)
         self.ctrl_kmin_cap   = nn.Parameter(torch.tensor(0.9))
         self.ctrl_kmin_base  = nn.Parameter(torch.tensor(0.8))
         self.ctrl_kmin_slope = nn.Parameter(torch.tensor(0.2))
+        # 13, 14: DQN scheduling (stored as log; rounded to int in usage)
+        self.log_train_freq  = nn.Parameter(torch.tensor(float(np.log(TRAIN_FREQUENCY))))
+        self.log_target_freq = nn.Parameter(torch.tensor(float(np.log(TARGET_NETWORK_FREQ))))
+        # F1: affine floor-slope for freq scale (sigmoid-bounded; init → scale ≈ 1 at m=0)
+        self.raw_tf_floor  = nn.Parameter(torch.tensor(5.0))
+        self.raw_tf_slope  = nn.Parameter(torch.tensor(-5.0))
+        self.raw_tgt_floor = nn.Parameter(torch.tensor(5.0))
+        self.raw_tgt_slope = nn.Parameter(torch.tensor(-5.0))
+        # F2: capped-linear freq scale (init → scale = 1 at m=0)
+        self.tf_cap   = nn.Parameter(torch.tensor(2.0))
+        self.tf_base  = nn.Parameter(torch.tensor(1.0))
+        self.tf_slope = nn.Parameter(torch.tensor(0.0))
+        self.tgt_cap   = nn.Parameter(torch.tensor(2.0))
+        self.tgt_base  = nn.Parameter(torch.tensor(1.0))
+        self.tgt_slope = nn.Parameter(torch.tensor(0.0))
+        # F3: log-affine m-coupling (init 0 → no m effect)
+        self.alpha_tf  = nn.Parameter(torch.tensor(0.0))
+        self.alpha_tgt = nn.Parameter(torch.tensor(0.0))
 
     def get_temp(self) -> torch.Tensor:
         return F.softplus(self.log_temp) + 1e-6
@@ -169,6 +198,103 @@ class LearnableGateParams(nn.Module):
     def get_m_divisor(self) -> torch.Tensor:
         return self.m_divisor.clamp(min=1e-6)
 
+    def get_lr_floor(self) -> torch.Tensor:
+        lo = 0.5 if self.stable_gate else 0.2
+        return self.lr_floor.clamp(min=lo, max=1.0)
+
+    def get_lr_slope(self) -> torch.Tensor:
+        return self.lr_slope.clamp(min=0.0, max=1.0)
+
+    @staticmethod
+    def _log_freq_near_baseline(log_param: torch.Tensor, baseline: float, rel: float = 0.2) -> torch.Tensor:
+        """Clamp log-frequency param so exp(log) stays within (1±rel)*baseline."""
+        log_base = log_param.new_tensor(float(np.log(baseline)))
+        log_lo = log_base + log_param.new_tensor(float(np.log(1.0 - rel)))
+        log_hi = log_base + log_param.new_tensor(float(np.log(1.0 + rel)))
+        return log_param.clamp(min=log_lo, max=log_hi)
+
+    def _eff_log_train_freq(self) -> torch.Tensor:
+        if self.stable_gate:
+            return self._log_freq_near_baseline(self.log_train_freq, TRAIN_FREQUENCY)
+        return self.log_train_freq
+
+    def _eff_log_target_freq(self) -> torch.Tensor:
+        if self.stable_gate:
+            return self._log_freq_near_baseline(self.log_target_freq, TARGET_NETWORK_FREQ)
+        return self.log_target_freq
+
+    def get_alpha_tf(self) -> torch.Tensor:
+        alpha = self.alpha_tf
+        return alpha.clamp(min=-1.0, max=1.0) if self.stable_gate else alpha
+
+    def get_alpha_tgt(self) -> torch.Tensor:
+        alpha = self.alpha_tgt
+        return alpha.clamp(min=-1.0, max=1.0) if self.stable_gate else alpha
+
+    def get_train_frequency(self) -> int:
+        log_f = self._eff_log_train_freq()
+        return max(1, int(round(log_f.exp().clamp(1.0, 100.0).item())))
+
+    def get_target_frequency(self) -> int:
+        log_f = self._eff_log_target_freq()
+        return max(1, int(round(log_f.exp().clamp(1.0, 5000.0).item())))
+
+    def get_tf_floor(self) -> torch.Tensor:
+        return 0.2 + 0.8 * torch.sigmoid(self.raw_tf_floor)
+
+    def get_tf_slope(self) -> torch.Tensor:
+        return torch.sigmoid(self.raw_tf_slope)
+
+    def get_tgt_floor(self) -> torch.Tensor:
+        return 0.2 + 0.8 * torch.sigmoid(self.raw_tgt_floor)
+
+    def get_tgt_slope(self) -> torch.Tensor:
+        return torch.sigmoid(self.raw_tgt_slope)
+
+    def _train_freq_scale(self, m: torch.Tensor) -> torch.Tensor:
+        if self.freq_formula == 1:
+            return self.get_tf_floor() + self.get_tf_slope() * m
+        if self.freq_formula == 2:
+            return torch.min(self.tf_cap, self.tf_base + self.tf_slope * m)
+        return torch.ones((), device=m.device, dtype=m.dtype)
+
+    def _target_freq_scale(self, m: torch.Tensor) -> torch.Tensor:
+        if self.freq_formula == 1:
+            return self.get_tgt_floor() + self.get_tgt_slope() * m
+        if self.freq_formula == 2:
+            return torch.min(self.tgt_cap, self.tgt_base + self.tgt_slope * m)
+        return torch.ones((), device=m.device, dtype=m.dtype)
+
+    def get_train_freq_soft(self, m: torch.Tensor) -> torch.Tensor:
+        """Differentiable train-frequency proxy (formula-dependent)."""
+        log_tf = self._eff_log_train_freq()
+        if self.freq_formula == 3:
+            return (log_tf + self.get_alpha_tf() * m).exp().clamp(1.0, 100.0)
+        return (log_tf.exp() * self._train_freq_scale(m)).clamp(1.0, 100.0)
+
+    def get_target_freq_soft(self, m: torch.Tensor) -> torch.Tensor:
+        """Differentiable target-frequency proxy (formula-dependent)."""
+        log_tgt = self._eff_log_target_freq()
+        if self.freq_formula == 3:
+            return (log_tgt + self.get_alpha_tgt() * m).exp().clamp(1.0, 5000.0)
+        return (log_tgt.exp() * self._target_freq_scale(m)).clamp(1.0, 5000.0)
+
+    def get_loss_scale(self, m: torch.Tensor) -> torch.Tensor:
+        """Shared scale for main and aux losses in learnable mode."""
+        lr_scale = self.get_lr_floor() + self.get_lr_slope() * m
+        train_freq_soft = self.get_train_freq_soft(m)
+        target_freq_soft = self.get_target_freq_soft(m)
+        base_tf = m.new_tensor(float(TRAIN_FREQUENCY))
+        base_tgt = m.new_tensor(float(TARGET_NETWORK_FREQ))
+        scale = (
+            lr_scale
+            * (base_tf / train_freq_soft)
+            * (base_tgt / target_freq_soft).sqrt()
+        )
+        if self.stable_gate:
+            return scale.clamp(min=1.0, max=2.0)
+        return scale
+
     def snapshot(self) -> Dict:
         """Return a float dict of current param values for logging."""
         return {
@@ -178,12 +304,28 @@ class LearnableGateParams(nn.Module):
             "trunk_scale":     float(F.softplus(self.log_trunk_scale).item()),
             "trunk_m_slope":   float(self.trunk_m_slope.item()),
             "m_divisor":       float(self.m_divisor.item()),
-            "lr_floor":        float(self.lr_floor.item()),
-            "lr_slope":        float(self.lr_slope.item()),
+            "lr_floor":        float(self.get_lr_floor().item()),
+            "lr_slope":        float(self.get_lr_slope().item()),
             "eps_bump":        float(self.eps_bump.item()),
             "ctrl_kmin_cap":   float(self.ctrl_kmin_cap.item()),
             "ctrl_kmin_base":  float(self.ctrl_kmin_base.item()),
             "ctrl_kmin_slope": float(self.ctrl_kmin_slope.item()),
+            "train_frequency": float(self.get_train_frequency()),
+            "target_frequency": float(self.get_target_frequency()),
+            "freq_formula":    float(self.freq_formula),
+            "tf_floor":        float(self.get_tf_floor().item()),
+            "tf_slope":        float(self.get_tf_slope().item()),
+            "tgt_floor":       float(self.get_tgt_floor().item()),
+            "tgt_slope":       float(self.get_tgt_slope().item()),
+            "tf_cap":          float(self.tf_cap.item()),
+            "tf_base":         float(self.tf_base.item()),
+            "tf_slope_cap":    float(self.tf_slope.item()),
+            "tgt_cap":         float(self.tgt_cap.item()),
+            "tgt_base":        float(self.tgt_base.item()),
+            "tgt_slope_cap":   float(self.tgt_slope.item()),
+            "alpha_tf":        float(self.get_alpha_tf().item()),
+            "alpha_tgt":       float(self.get_alpha_tgt().item()),
+            "stable_gate":     float(self.stable_gate),
         }
 
 
@@ -200,12 +342,16 @@ class BFeedbackConfGateNetwork(nn.Module):
         learnable_gate: bool = False,
         gate_k_min: float = 0.8,
         gate_k_max: float = 1.0,
+        freq_formula: int = 3,
+        stable_gate: bool = False,
     ):
         super().__init__()
         self.obs_dim            = obs_dim
         self.n_actions          = n_actions
         self.confidence_gating  = confidence_gating
         self.learnable_gate     = learnable_gate
+        self.freq_formula       = freq_formula
+        self.stable_gate        = stable_gate
         # Non-learnable gate bounds (used when learnable_gate=False)
         self.gate_k_min         = gate_k_min
         self.gate_k_max         = gate_k_max
@@ -222,7 +368,9 @@ class BFeedbackConfGateNetwork(nn.Module):
         self.trunk_scale: float = 1.0  # used only when learnable_gate=False
 
         if learnable_gate:
-            self.gate_params = LearnableGateParams()
+            self.gate_params = LearnableGateParams(
+                freq_formula=freq_formula, stable_gate=stable_gate,
+            )
 
     @staticmethod
     def _mask_cart(obs: torch.Tensor) -> torch.Tensor:
@@ -487,6 +635,9 @@ def run_one(
     learning_starts: int = LEARNING_STARTS,   # steps of pure collection before training
     train_frequency: int = TRAIN_FREQUENCY,   # env steps between gradient updates
     learnable_gate: bool = False,     # make gate/controller scalars nn.Parameters
+    freq_formula: int = 3,          # 1=affine, 2=capped-linear, 3=log-affine
+    scale_aux_loss: bool = False,   # apply learnable loss scale to cart/pole aux heads
+    stable_gate: bool = False,      # clamp loss_scale, alphas, and base frequencies
 ) -> Dict:
     _set_seed(seed)
     env    = gym.make("CartPole-v1")
@@ -504,6 +655,8 @@ def run_one(
         learnable_gate=learnable_ok,
         gate_k_min=gate_k_min,
         gate_k_max=gate_k_max,
+        freq_formula=freq_formula,
+        stable_gate=stable_gate,
     ).to(device)
     t_net  = BFeedbackConfGateNetwork(
         obs_dim, n_actions,
@@ -511,6 +664,8 @@ def run_one(
         learnable_gate=learnable_ok,
         gate_k_min=gate_k_min,
         gate_k_max=gate_k_max,
+        freq_formula=freq_formula,
+        stable_gate=stable_gate,
     ).to(device)
     t_net.load_state_dict(q_net.state_dict())
 
@@ -573,8 +728,15 @@ def run_one(
         if done:
             obs, _ = env.reset()
 
+        cur_train_freq  = (
+            q_net.gate_params.get_train_frequency() if learnable_ok else train_frequency
+        )
+        cur_target_freq = (
+            q_net.gate_params.get_target_frequency() if learnable_ok else target_freq
+        )
+
         # --- training step ---
-        if t > learning_starts and t % train_frequency == 0:
+        if t > learning_starts and t % cur_train_freq == 0:
             data = rb.sample(BATCH_SIZE)
 
             with torch.no_grad():
@@ -600,17 +762,22 @@ def run_one(
                 _eps_end   = controller.effective_end_e
                 _eps_decay = controller.effective_decay_ep
 
-            # Learnable mode: items 6–8 — LR scaling via loss + eps_bump for exploration
+            # Learnable mode: items 6–8, 15–16 — LR + freq scaling via loss
             if learnable_ok and m_stats is not None and "m_tensor" in m_stats:
-                gp   = q_net.gate_params
-                m_t  = m_stats["m_tensor"].detach()
-                lr_scale = (gp.lr_floor + gp.lr_slope * m_t).clamp(min=1e-3)
-                effective_loss = loss_full * lr_scale
+                gp      = q_net.gate_params
+                m_t     = m_stats["m_tensor"].detach()
+                loss_scale = gp.get_loss_scale(m_t)
+                effective_loss = loss_full * loss_scale
+                if scale_aux_loss:
+                    effective_aux_loss = (loss_cart + loss_pole) * loss_scale.detach()
+                else:
+                    effective_aux_loss = loss_cart + loss_pole
                 _eps_end = float(
                     (END_E + (1.0 - m_t.clamp(0.0, 1.0)) * gp.eps_bump).item()
                 )
             else:
                 effective_loss = loss_full
+                effective_aux_loss = loss_cart + loss_pole
 
             opt_main.zero_grad()
             # retain_graph when learnable_ok because loss_full holds a path through
@@ -627,7 +794,7 @@ def run_one(
             opt_main.step()
 
             opt_aux.zero_grad()
-            (loss_cart + loss_pole).backward()
+            effective_aux_loss.backward()
             opt_aux.step()
 
             loss_list.append(loss_full.item())
@@ -653,7 +820,7 @@ def run_one(
                 snap.update({"step": t, "episode": len(episode_returns)})
                 gate_params_history.append(snap)
 
-        if t % target_freq == 0:
+        if t % cur_target_freq == 0:
             t_net.load_state_dict(q_net.state_dict())
 
         if (t + 1) % 100_000 == 0 or t == 0:
@@ -678,6 +845,10 @@ def run_one(
     ctrl_active = use_controller and gate_ok
     if algo_tag_override is not None:
         algo_tag = algo_tag_override
+    elif learnable_ok and stable_gate:
+        algo_tag = "b_feedb_cg_learnable_stable"
+    elif learnable_ok and scale_aux_loss:
+        algo_tag = "b_feedb_cg_learnable_aux_scaled"
     elif learnable_ok:
         algo_tag = "b_feedb_cg_learnable"
     elif ctrl_active:
@@ -693,6 +864,9 @@ def run_one(
         torch.save({
             "algo":                algo_tag,
             "seed":                seed,
+            "freq_formula":        freq_formula,
+            "scale_aux_loss":      scale_aux_loss,
+            "stable_gate":         stable_gate,
             "episode_returns":     episode_returns,
             "gate_history":        gate_history,
             "controller_history":  controller_history,
@@ -713,6 +887,9 @@ def run_one(
         "confidence_gating":   gate_ok,
         "use_controller":      ctrl_active,
         "learnable_gate":      learnable_ok,
+        "freq_formula":        freq_formula,
+        "scale_aux_loss":      scale_aux_loss,
+        "stable_gate":         stable_gate,
         "episode_returns":     episode_returns,
         "gate_history":        gate_history,
         "controller_history":  controller_history,
@@ -1224,6 +1401,14 @@ def _ckpt_path_learnable(ckpt_dir: Path, seed: int) -> Path:
     return ckpt_dir / f"b_feedb_cg_learnable_seed{seed}.pt"
 
 
+def _ckpt_path_learnable_aux_scaled(ckpt_dir: Path, seed: int) -> Path:
+    return ckpt_dir / f"b_feedb_cg_learnable_aux_scaled_seed{seed}.pt"
+
+
+def _ckpt_path_learnable_stable(ckpt_dir: Path, seed: int) -> Path:
+    return ckpt_dir / f"b_feedb_cg_learnable_stable_seed{seed}.pt"
+
+
 def _ckpt_episode_count(ckpt_dir: Path, seed: int, gated: bool = False) -> int:
     path = _ckpt_path(ckpt_dir, seed, gated)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -1239,11 +1424,52 @@ def _load_result_learnable(ckpt_dir: Path, seed: int) -> Dict:
         "seed":                seed,
         "confidence_gating":   True,
         "learnable_gate":      True,
+        "freq_formula":        ckpt.get("freq_formula", 3),
         "episode_returns":     ep,
         "gate_history":        ckpt.get("gate_history", []),
         "gate_params_history": ckpt.get("gate_params_history", []),
         "last100_mean":        last100,
     }
+
+
+def _load_result_learnable_stable(ckpt_dir: Path, seed: int) -> Dict:
+    path = _ckpt_path_learnable_stable(ckpt_dir, seed)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ep      = ckpt["episode_returns"]
+    last100 = float(np.mean(ep[-100:])) if len(ep) >= 100 else float(np.mean(ep)) if ep else 0.0
+    return {
+        "seed":                seed,
+        "confidence_gating":   True,
+        "learnable_gate":      True,
+        "stable_gate":         True,
+        "freq_formula":        ckpt.get("freq_formula", 3),
+        "episode_returns":     ep,
+        "gate_history":        ckpt.get("gate_history", []),
+        "gate_params_history": ckpt.get("gate_params_history", []),
+        "last100_mean":        last100,
+    }
+
+
+def _load_result_learnable_aux_scaled(ckpt_dir: Path, seed: int) -> Dict:
+    path = _ckpt_path_learnable_aux_scaled(ckpt_dir, seed)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ep      = ckpt["episode_returns"]
+    last100 = float(np.mean(ep[-100:])) if len(ep) >= 100 else float(np.mean(ep)) if ep else 0.0
+    return {
+        "seed":                seed,
+        "confidence_gating":   True,
+        "learnable_gate":      True,
+        "scale_aux_loss":      True,
+        "freq_formula":        ckpt.get("freq_formula", 3),
+        "episode_returns":     ep,
+        "gate_history":        ckpt.get("gate_history", []),
+        "gate_params_history": ckpt.get("gate_params_history", []),
+        "last100_mean":        last100,
+    }
+
+
+def _freq_formula_ckpt_dir(decay_tag: str, ep_tag: str, formula: int) -> Path:
+    return ROOT / "paper" / "_tmp_b_feedb_cg" / f"ckpt_learnable_freqf{formula}_{decay_tag}{ep_tag}"
 
 
 # ---------------------------------------------------------------------------
@@ -1291,6 +1517,68 @@ def plot_learnable_vs_baseline(
         fontsize=11,
     )
     ax.legend(loc="lower right", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 520)
+    FIG_LEARNABLE_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_jpg, dpi=150, bbox_inches="tight", format="jpeg")
+    plt.close(fig)
+    print(f"Wrote {out_jpg}", flush=True)
+
+
+def plot_freq_formula_compare(
+    f1_results: List[Dict],
+    f2_results: List[Dict],
+    f3_results: List[Dict],
+    out_jpg: Path,
+    decay_tag: str,
+    n_ep: Optional[int] = None,
+    dqn_results: Optional[List[Dict]] = None,
+) -> None:
+    """Compare learnable gate with freq formulas F1, F2, F3 on one figure."""
+    FORMULA_COLORS = {1: "#d62728", 2: "#ff7f0e", 3: "#9467bd"}
+    FORMULA_LABELS = {
+        1: "F1: affine floor+slope",
+        2: "F2: capped linear",
+        3: "F3: log-affine",
+    }
+
+    def _prep_one(results: List[Dict]):
+        arrays = [np.asarray(r["episode_returns"]) for r in results]
+        n = min(len(a) for a in arrays)
+        M = np.stack([a[:n] for a in arrays], axis=0)
+        mu = M.mean(0)
+        sd = M.std(0, ddof=1) if M.shape[0] > 1 else np.zeros(n)
+        W = max(1, n // 200)
+        ep = np.arange(1, n + 1)
+        return ep[W - 1:], _smooth(mu, W), _smooth(sd, W)
+
+    ep_str = f"{n_ep:,} ep" if n_ep else decay_tag
+    fig, ax = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
+
+    if dqn_results:
+        ep_d, sm_d, sd_d = _prep_one(dqn_results)
+        l100_d = float(np.mean([r["last100_mean"] for r in dqn_results]))
+        ax.fill_between(ep_d, sm_d - sd_d, sm_d + sd_d, color=COLOR_DQN, alpha=0.12, linewidth=0)
+        ax.plot(ep_d, sm_d, color=COLOR_DQN, lw=2.0, ls="--",
+                label=f"DQN baseline  last-100: {l100_d:.1f}")
+
+    for formula, results in [(1, f1_results), (2, f2_results), (3, f3_results)]:
+        ep_f, sm_f, sd_f = _prep_one(results)
+        l100_f = float(np.mean([r["last100_mean"] for r in results]))
+        color = FORMULA_COLORS[formula]
+        ax.plot(ep_f, sm_f, color=color, lw=2.2,
+                label=f"{FORMULA_LABELS[formula]}  last-100: {l100_f:.1f}")
+
+    ax.axhline(500, color="gray", lw=1.0, ls=":", alpha=0.6, label="max (500)")
+    ax.set_xlabel("Episode", fontsize=12)
+    ax.set_ylabel("Episodic return", fontsize=12)
+    n_seeds = len(f1_results)
+    ax.set_title(
+        f"Learnable gate: freq formula comparison  "
+        f"({n_seeds} seed(s), {ep_str})",
+        fontsize=11,
+    )
+    ax.legend(loc="lower right", fontsize=9)
     ax.grid(True, alpha=0.3)
     ax.set_ylim(0, 520)
     FIG_LEARNABLE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1419,6 +1707,121 @@ def plot_learnable_vs_dqn(
     print(f"Wrote {out_jpg}", flush=True)
 
 
+def plot_learnable_aux_scaled_compare(
+    aux_scaled_results: List[Dict],
+    unscaled_results: List[Dict],
+    dqn_results: List[Dict],
+    out_jpg: Path,
+    decay_tag: str,
+    n_ep: Optional[int] = None,
+) -> None:
+    """Compare learnable gate with scaled aux losses vs unscaled vs DQN."""
+    COLOR_AUX = "#9467bd"
+    COLOR_OLD = "#d62728"
+
+    def _prep(results: List[Dict]):
+        arrays = [np.asarray(r["episode_returns"]) for r in results]
+        n = min(len(a) for a in arrays)
+        M = np.stack([a[:n] for a in arrays], axis=0)
+        mu = M.mean(0)
+        W = max(1, n // 200)
+        ep = np.arange(1, n + 1)
+        return ep[W - 1:], _smooth(mu, W)
+
+    ep_a, sm_a = _prep(aux_scaled_results)
+    ep_u, sm_u = _prep(unscaled_results)
+    ep_d, sm_d = _prep(dqn_results)
+
+    l100_a = float(np.mean([r["last100_mean"] for r in aux_scaled_results]))
+    l100_u = float(np.mean([r["last100_mean"] for r in unscaled_results]))
+    l100_d = float(np.mean([r["last100_mean"] for r in dqn_results]))
+
+    ep_str = f"{n_ep:,} ep" if n_ep else decay_tag
+    fig, ax = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
+    ax.plot(ep_a, sm_a, color=COLOR_AUX, lw=2.2,
+            label=f"learnable (aux scaled)  last-100: {l100_a:.1f}")
+    ax.plot(ep_u, sm_u, color=COLOR_OLD, lw=2.2, ls="--",
+            label=f"learnable (aux unscaled)  last-100: {l100_u:.1f}")
+    ax.plot(ep_d, sm_d, color=COLOR_DQN, lw=2.2, ls="-.",
+            label=f"DQN baseline  last-100: {l100_d:.1f}")
+    ax.axhline(500, color="gray", lw=1.0, ls=":", alpha=0.6, label="max (500)")
+    ax.set_xlabel("Episode", fontsize=12)
+    ax.set_ylabel("Episodic return", fontsize=12)
+    ax.set_title(
+        f"Learnable gate: aux-scaled vs unscaled  "
+        f"({len(aux_scaled_results)} seed(s), {ep_str})",
+        fontsize=11,
+    )
+    ax.legend(loc="lower right", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 520)
+    FIG_LEARNABLE_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_jpg, dpi=150, bbox_inches="tight", format="jpeg")
+    plt.close(fig)
+    print(f"Wrote {out_jpg}", flush=True)
+
+
+def plot_learnable_stable_compare(
+    stable_results: List[Dict],
+    old_results: List[Dict],
+    dqn_results: List[Dict],
+    out_jpg: Path,
+    decay_tag: str,
+    n_ep: Optional[int] = None,
+) -> None:
+    """Stable learnable gate vs original learnable vs DQN (same layout as 10-seed figure)."""
+    COLOR_STABLE = "#2ca02c"
+    COLOR_OLD    = "#d62728"
+
+    def _prep(results: List[Dict]):
+        arrays = [np.asarray(r["episode_returns"]) for r in results]
+        n = min(len(a) for a in arrays)
+        M = np.stack([a[:n] for a in arrays], axis=0)
+        mu = M.mean(0)
+        sd = M.std(0, ddof=1) if M.shape[0] > 1 else np.zeros(n)
+        W = max(1, n // 200)
+        ep = np.arange(1, n + 1)
+        return ep[W - 1:], _smooth(mu, W), _smooth(sd, W), n
+
+    ep_s, sm_s, sd_s, n_align = _prep(stable_results)
+    ep_o, sm_o, sd_o, _ = _prep(old_results)
+    ep_d, sm_d, sd_d, _ = _prep(dqn_results)
+
+    l100_s = float(np.mean([r["last100_mean"] for r in stable_results]))
+    l100_o = float(np.mean([r["last100_mean"] for r in old_results]))
+    l100_d = float(np.mean([r["last100_mean"] for r in dqn_results]))
+
+    ep_str = f"{n_ep:,} ep" if n_ep else decay_tag
+    fig, ax = plt.subplots(figsize=(10, 5.5), constrained_layout=True)
+    if len(old_results) > 1:
+        ax.fill_between(ep_o, sm_o - sd_o, sm_o + sd_o, color=COLOR_OLD, alpha=0.15, linewidth=0)
+    if len(dqn_results) > 1:
+        ax.fill_between(ep_d, sm_d - sd_d, sm_d + sd_d, color=COLOR_DQN, alpha=0.15, linewidth=0)
+    if len(stable_results) > 1:
+        ax.fill_between(ep_s, sm_s - sd_s, sm_s + sd_s, color=COLOR_STABLE, alpha=0.15, linewidth=0)
+    ax.plot(ep_s, sm_s, color=COLOR_STABLE, lw=2.2,
+            label=f"learnable (stable)  last-100: {l100_s:.1f}  (n={len(stable_results)})")
+    ax.plot(ep_o, sm_o, color=COLOR_OLD, lw=2.2,
+            label=f"learnable (original)  last-100: {l100_o:.1f}  (n={len(old_results)})")
+    ax.plot(ep_d, sm_d, color=COLOR_DQN, lw=2.2,
+            label=f"DQN baseline  last-100: {l100_d:.1f}  (n={len(dqn_results)})")
+    ax.axhline(500, color="gray", lw=1.0, ls="--", alpha=0.6, label="max (500)")
+    ax.set_xlabel("Episode", fontsize=12)
+    ax.set_ylabel("Episodic return", fontsize=12)
+    ax.set_title(
+        f"Learnable gate (stable fixes) vs original vs DQN  "
+        f"(aligned to {n_align:,} ep, {ep_str})",
+        fontsize=11,
+    )
+    ax.legend(loc="lower right", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 520)
+    FIG_LEARNABLE_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_jpg, dpi=150, bbox_inches="tight", format="jpeg")
+    plt.close(fig)
+    print(f"Wrote {out_jpg}", flush=True)
+
+
 def plot_gate_params_history(
     learnable_results: List[Dict],
     out_jpg: Path,
@@ -1439,9 +1842,11 @@ def plot_gate_params_history(
     grid = np.linspace(lo, hi, 256)
 
     keys = [
-        "gate_k_min", "gate_k_max", "temp", "trunk_scale", "m_divisor",
+        "gate_k_min", "gate_k_max", "temp", "trunk_scale", "trunk_m_slope", "m_divisor",
         "lr_floor", "lr_slope", "eps_bump",
         "ctrl_kmin_base", "ctrl_kmin_cap", "ctrl_kmin_slope",
+        "train_frequency", "target_frequency",
+        "alpha_tf", "alpha_tgt",
     ]
     fig, axes = plt.subplots(len(keys), 1, figsize=(9, 2.2 * len(keys)),
                              sharex=True, constrained_layout=True)
@@ -1462,6 +1867,73 @@ def plot_gate_params_history(
     axes[0].set_title(
         f"Learned gate param trajectories  ({len(hists)} seed(s))", fontsize=11
     )
+    FIG_LEARNABLE_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_jpg, dpi=150, bbox_inches="tight", format="jpeg")
+    plt.close(fig)
+    print(f"Wrote {out_jpg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Learnable comparison plot (old 12-param vs new bounded-lr)
+# ---------------------------------------------------------------------------
+
+def plot_learnable_compare(
+    old_results: List[Dict],
+    new_results: List[Dict],
+    dqn_results: List[Dict],
+    out_jpg: Path,
+    decay_tag: str,
+    n_ep: Optional[int] = None,
+) -> None:
+    """Plot old learnable gate vs bounded-lr learnable gate vs DQN baseline."""
+    COLOR_OLD  = "#d62728"   # red  — original 12-param
+    COLOR_NEW  = "#ff7f0e"   # orange — bounded lr_floor/lr_slope
+    COLOR_DQN_ = COLOR_DQN   # blue
+
+    def _prep(results: List[Dict]):
+        arrays = [np.asarray(r["episode_returns"]) for r in results]
+        n = min(len(a) for a in arrays)
+        M = np.stack([a[:n] for a in arrays], axis=0)
+        mu = M.mean(0)
+        sd = M.std(0, ddof=1) if M.shape[0] > 1 else np.zeros(n)
+        W = max(1, n // 200)
+        ep = np.arange(1, n + 1)
+        return ep[W - 1:], _smooth(mu, W), _smooth(sd, W), n
+
+    ep_o, sm_o, sd_o, n_old  = _prep(old_results)
+    ep_n, sm_n, sd_n, _      = _prep(new_results)
+    ep_d, sm_d, sd_d, _      = _prep(dqn_results)
+
+    l100_o = float(np.mean([r["last100_mean"] for r in old_results]))
+    l100_n = float(np.mean([r["last100_mean"] for r in new_results]))
+    l100_d = float(np.mean([r["last100_mean"] for r in dqn_results]))
+
+    ep_str = f"{n_ep:,} ep" if n_ep else decay_tag
+    n_old_seeds = len(old_results)
+    n_new_seeds = len(new_results)
+    n_dqn_seeds = len(dqn_results)
+
+    fig, ax = plt.subplots(figsize=(9, 5), constrained_layout=True)
+    ax.fill_between(ep_o, sm_o - sd_o, sm_o + sd_o, color=COLOR_OLD,  alpha=0.15, linewidth=0)
+    ax.fill_between(ep_n, sm_n - sd_n, sm_n + sd_n, color=COLOR_NEW,  alpha=0.15, linewidth=0)
+    ax.fill_between(ep_d, sm_d - sd_d, sm_d + sd_d, color=COLOR_DQN_, alpha=0.15, linewidth=0)
+    ax.plot(ep_o, sm_o, color=COLOR_OLD,  lw=2.2,
+            label=f"learnable gate (orig.)  last-100: {l100_o:.1f}  (n={n_old_seeds})")
+    ax.plot(ep_n, sm_n, color=COLOR_NEW,  lw=2.2,
+            label=f"learnable gate (bdlr)   last-100: {l100_n:.1f}  (n={n_new_seeds})")
+    ax.plot(ep_d, sm_d, color=COLOR_DQN_, lw=2.2,
+            label=f"DQN baseline            last-100: {l100_d:.1f}  (n={n_dqn_seeds})")
+    ax.axhline(500, color="gray", lw=1.0, ls="--", alpha=0.6, label="max (500)")
+    ax.set_xlabel("Episode", fontsize=12)
+    ax.set_ylabel("Episodic return", fontsize=12)
+    ax.set_title(
+        f"Learnable gate: original vs bounded lr_floor/lr_slope  "
+        f"({ep_str}, ±1 std)",
+        fontsize=11,
+    )
+    ax.legend(loc="lower right", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 520)
     FIG_LEARNABLE_DIR.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_jpg, dpi=150, bbox_inches="tight", format="jpeg")
     plt.close(fig)
@@ -1526,6 +1998,19 @@ def main() -> None:
     p.add_argument("--learnable", action="store_true",
                    help="Run learnable-gate experiment: trains baseline + learnable-gate "
                         "and saves comparison figures to paper/figures/conf_learnable/.")
+    p.add_argument("--learnable-bounded-lr", action="store_true",
+                   help="Run learnable-gate experiment with sigmoid-bounded lr_floor/lr_slope "
+                        "(Suggestion 1 fix). Saves to ckpt_learnable_bdlr_* and plots alongside "
+                        "the original learnable run from ckpt_learnable_*.")
+    p.add_argument("--compare-freq-formulas", action="store_true",
+                   help="Train learnable gate with freq formulas F1/F2/F3 (1 seed each by default) "
+                        "and save comparison figure to paper/figures/conf_learnable/.")
+    p.add_argument("--learnable-aux-scaled", action="store_true",
+                   help="Train learnable gate with aux losses scaled like main loss; "
+                        "plot vs unscaled learnable + DQN to conf_learnable/*aux_scaled*.jpg")
+    p.add_argument("--learnable-stable", action="store_true",
+                   help="Train learnable gate with stability fixes (loss_scale>=1, clamp alphas, "
+                        "fix base freqs); plot vs 10-seed original learnable + DQN.")
     args = p.parse_args()
 
     seeds  = _parse_seeds(args.seeds)
@@ -1564,6 +2049,14 @@ def main() -> None:
         print(f"  Mode       : COMPARE-CTRL (baseline vs controller, unclipped m)", flush=True)
     if args.learnable:
         print(f"  Mode       : LEARNABLE-GATE (baseline vs learnable gate params)", flush=True)
+    if args.learnable_bounded_lr:
+        print(f"  Mode       : LEARNABLE-BOUNDED-LR (sigmoid-bounded lr_floor/lr_slope)", flush=True)
+    if args.compare_freq_formulas:
+        print(f"  Mode       : COMPARE-FREQ-FORMULAS (F1 affine / F2 capped / F3 log-affine)", flush=True)
+    if args.learnable_aux_scaled:
+        print(f"  Mode       : LEARNABLE-AUX-SCALED (aux losses use main loss scale)", flush=True)
+    if args.learnable_stable:
+        print(f"  Mode       : LEARNABLE-STABLE (loss_scale in [1,2], clamp alphas, fix freqs)", flush=True)
     print(f"  Checkpoints: {ckpt_dir}", flush=True)
     print("=" * 60, flush=True)
 
@@ -2192,6 +2685,226 @@ def main() -> None:
         )
         return
 
+    if args.learnable_stable:
+        ep_tag = f"_ep{n_ep_target}" if n_ep_target is not None else ""
+        stable_ckpt_dir = (
+            ROOT / "paper" / "_tmp_b_feedb_cg" / f"ckpt_learnable_stable_{decay_tag}{ep_tag}"
+        )
+        old_ckpt_dir = (
+            ROOT / "paper" / "_tmp_b_feedb_cg" / f"ckpt_learnable_{decay_tag}{ep_tag}"
+        )
+        dqn_ckpt_dir = ROOT / "paper" / "_tmp_dqn_ctrl" / f"ckpt_{decay_tag}"
+        ref_seeds = list(DEFAULT_SEEDS)
+
+        if not args.plot_only:
+            stable_seeds_to_run = [
+                s for s in seeds if not _ckpt_path_learnable_stable(stable_ckpt_dir, s).exists()
+            ] if args.train_missing_only else list(seeds)
+            if stable_seeds_to_run:
+                ep_str = f"up to {n_ep_target:,} ep" if n_ep_target else f"{n_step:,} steps"
+                print(
+                    f"\n>>> [LEARNABLE-STABLE] Training seeds {stable_seeds_to_run} for {ep_str} ...",
+                    flush=True,
+                )
+                t0 = time.perf_counter()
+                for seed in stable_seeds_to_run:
+                    run_one(seed, n_step, True, device,
+                            checkpoint_dir=stable_ckpt_dir,
+                            epsilon_decay_episodes=eps_decay_ep,
+                            total_episodes=n_ep_target,
+                            learnable_gate=True,
+                            stable_gate=True)
+                print(
+                    f">>> [LEARNABLE-STABLE] Done in {time.perf_counter() - t0:.1f}s",
+                    flush=True,
+                )
+            else:
+                print(">>> LEARNABLE-STABLE: all checkpoints present, skipping.", flush=True)
+
+        for seed in seeds:
+            if not _ckpt_path_learnable_stable(stable_ckpt_dir, seed).exists():
+                raise FileNotFoundError(
+                    f"Missing stable learnable checkpoint for seed {seed} in {stable_ckpt_dir}"
+                )
+
+        old_seeds = [s for s in ref_seeds if _ckpt_path_learnable(old_ckpt_dir, s).exists()]
+        if not old_seeds:
+            raise FileNotFoundError(
+                f"Original learnable checkpoints required in {old_ckpt_dir} for comparison plot"
+            )
+        dqn_seeds = [
+            s for s in ref_seeds if (dqn_ckpt_dir / f"dqn_base_soft_seed{s}.pt").exists()
+        ]
+        if not dqn_seeds:
+            raise FileNotFoundError(
+                f"DQN checkpoints required in {dqn_ckpt_dir} for comparison plot"
+            )
+
+        stable_res = [_load_result_learnable_stable(stable_ckpt_dir, s) for s in seeds]
+        old_res    = [_load_result_learnable(old_ckpt_dir, s) for s in old_seeds]
+        dqn_res    = [_load_dqn_base(dqn_ckpt_dir, s) for s in dqn_seeds]
+
+        print("\n=== Final-100-episode summary (stable learnable gate) ===", flush=True)
+        _agg_print(stable_res, "learnable (stable)")
+        _agg_print(old_res,    f"learnable (original, n={len(old_seeds)})")
+        _agg_print(dqn_res,    f"DQN baseline (n={len(dqn_seeds)})")
+
+        n_str = f"{len(seeds)}seed{'s' if len(seeds) > 1 else ''}"
+        plot_learnable_stable_compare(
+            stable_res,
+            old_res,
+            dqn_res,
+            FIG_LEARNABLE_DIR / f"baseline_vs_learnable_stable_{n_str}_{decay_tag}{ep_tag}.jpg",
+            decay_tag,
+            n_ep=n_ep_target,
+        )
+        plot_gate_params_history(
+            stable_res,
+            FIG_LEARNABLE_DIR / f"gate_params_history_stable_{n_str}_{decay_tag}{ep_tag}.jpg",
+        )
+        return
+
+    if args.learnable_aux_scaled:
+        ep_tag = f"_ep{n_ep_target}" if n_ep_target is not None else ""
+        aux_ckpt_dir = (
+            ROOT / "paper" / "_tmp_b_feedb_cg" / f"ckpt_learnable_aux_scaled_{decay_tag}{ep_tag}"
+        )
+        unscaled_ckpt_dir = (
+            ROOT / "paper" / "_tmp_b_feedb_cg" / f"ckpt_learnable_{decay_tag}{ep_tag}"
+        )
+
+        if not args.plot_only:
+            aux_seeds_to_run = [
+                s for s in seeds if not _ckpt_path_learnable_aux_scaled(aux_ckpt_dir, s).exists()
+            ] if args.train_missing_only else list(seeds)
+            if aux_seeds_to_run:
+                ep_str = f"up to {n_ep_target:,} ep" if n_ep_target else f"{n_step:,} steps"
+                print(
+                    f"\n>>> [LEARNABLE-AUX-SCALED] Training seeds {aux_seeds_to_run} for {ep_str} ...",
+                    flush=True,
+                )
+                t0 = time.perf_counter()
+                for seed in aux_seeds_to_run:
+                    run_one(seed, n_step, True, device,
+                            checkpoint_dir=aux_ckpt_dir,
+                            epsilon_decay_episodes=eps_decay_ep,
+                            total_episodes=n_ep_target,
+                            learnable_gate=True,
+                            scale_aux_loss=True)
+                print(
+                    f">>> [LEARNABLE-AUX-SCALED] Done in {time.perf_counter() - t0:.1f}s",
+                    flush=True,
+                )
+            else:
+                print(">>> LEARNABLE-AUX-SCALED: all checkpoints present, skipping.", flush=True)
+
+        for seed in seeds:
+            if not _ckpt_path_learnable_aux_scaled(aux_ckpt_dir, seed).exists():
+                raise FileNotFoundError(
+                    f"Missing aux-scaled learnable checkpoint for seed {seed} in {aux_ckpt_dir}"
+                )
+            if not _ckpt_path_learnable(unscaled_ckpt_dir, seed).exists():
+                raise FileNotFoundError(
+                    f"Missing unscaled learnable checkpoint for seed {seed} in {unscaled_ckpt_dir}"
+                )
+
+        aux_res = [_load_result_learnable_aux_scaled(aux_ckpt_dir, s) for s in seeds]
+        unscaled_res = [_load_result_learnable(unscaled_ckpt_dir, s) for s in seeds]
+
+        print("\n=== Final-100-episode summary (aux-scaled learnable gate) ===", flush=True)
+        _agg_print(aux_res, "learnable (aux scaled)")
+        _agg_print(unscaled_res, "learnable (aux unscaled)")
+
+        n_str = f"{len(seeds)}seed{'s' if len(seeds) > 1 else ''}"
+        dqn_ckpt_dir = ROOT / "paper" / "_tmp_dqn_ctrl" / f"ckpt_{decay_tag}"
+        dqn_seeds = [
+            s for s in seeds
+            if (dqn_ckpt_dir / f"dqn_base_soft_seed{s}.pt").exists()
+        ]
+        if not dqn_seeds:
+            raise FileNotFoundError(
+                f"DQN checkpoints required for aux-scaled plot; none found in {dqn_ckpt_dir}"
+            )
+        dqn_res = [_load_dqn_base(dqn_ckpt_dir, s) for s in dqn_seeds]
+        _agg_print(dqn_res, "DQN baseline")
+
+        plot_learnable_aux_scaled_compare(
+            aux_res,
+            unscaled_res,
+            dqn_res,
+            FIG_LEARNABLE_DIR / f"baseline_vs_learnable_aux_scaled_{n_str}_{decay_tag}{ep_tag}.jpg",
+            decay_tag,
+            n_ep=n_ep_target,
+        )
+        plot_gate_params_history(
+            aux_res,
+            FIG_LEARNABLE_DIR / f"gate_params_history_aux_scaled_{n_str}_{decay_tag}{ep_tag}.jpg",
+        )
+        return
+
+    if args.compare_freq_formulas:
+        ep_tag = f"_ep{n_ep_target}" if n_ep_target is not None else ""
+        formula_results: Dict[int, List[Dict]] = {}
+
+        for formula in (1, 2, 3):
+            f_ckpt_dir = _freq_formula_ckpt_dir(decay_tag, ep_tag, formula)
+            if not args.plot_only:
+                f_seeds_to_run = [
+                    s for s in seeds if not _ckpt_path_learnable(f_ckpt_dir, s).exists()
+                ] if args.train_missing_only else list(seeds)
+                if f_seeds_to_run:
+                    ep_str = f"up to {n_ep_target:,} ep" if n_ep_target else f"{n_step:,} steps"
+                    print(
+                        f"\n>>> [FREQ-F{formula}] Training seeds {f_seeds_to_run} for {ep_str} ...",
+                        flush=True,
+                    )
+                    t0 = time.perf_counter()
+                    for seed in f_seeds_to_run:
+                        run_one(seed, n_step, True, device,
+                                checkpoint_dir=f_ckpt_dir,
+                                epsilon_decay_episodes=eps_decay_ep,
+                                total_episodes=n_ep_target,
+                                learnable_gate=True,
+                                freq_formula=formula)
+                    print(
+                        f">>> [FREQ-F{formula}] Done in {time.perf_counter() - t0:.1f}s",
+                        flush=True,
+                    )
+                else:
+                    print(f">>> FREQ-F{formula}: all checkpoints present, skipping.", flush=True)
+
+            for seed in seeds:
+                if not _ckpt_path_learnable(f_ckpt_dir, seed).exists():
+                    raise FileNotFoundError(
+                        f"Missing F{formula} learnable checkpoint for seed {seed} in {f_ckpt_dir}"
+                    )
+            formula_results[formula] = [_load_result_learnable(f_ckpt_dir, s) for s in seeds]
+
+        print("\n=== Final-100-episode summary (freq formula comparison) ===", flush=True)
+        for formula in (1, 2, 3):
+            _agg_print(formula_results[formula], f"freq formula F{formula}")
+
+        n_str = f"{len(seeds)}seed{'s' if len(seeds) > 1 else ''}"
+        dqn_ckpt_dir = ROOT / "paper" / "_tmp_dqn_ctrl" / f"ckpt_{decay_tag}"
+        dqn_seeds = [
+            s for s in seeds
+            if (dqn_ckpt_dir / f"dqn_base_soft_seed{s}.pt").exists()
+        ]
+        dqn_res = [_load_dqn_base(dqn_ckpt_dir, s) for s in dqn_seeds] if dqn_seeds else None
+        if dqn_res:
+            _agg_print(dqn_res, "DQN baseline")
+
+        plot_freq_formula_compare(
+            formula_results[1],
+            formula_results[2],
+            formula_results[3],
+            FIG_LEARNABLE_DIR / f"freq_formula_compare_{n_str}_{decay_tag}{ep_tag}.jpg",
+            decay_tag,
+            n_ep=n_ep_target,
+            dqn_results=dqn_res,
+        )
+        return
+
     if args.learnable:
         ep_tag = f"_ep{n_ep_target}" if n_ep_target is not None else ""
         learn_ckpt_dir = ROOT / "paper" / "_tmp_b_feedb_cg" / f"ckpt_learnable_{decay_tag}{ep_tag}"
@@ -2274,14 +2987,100 @@ def main() -> None:
         _agg_print(learn_res, "learnable gate")
 
         n_str  = f"{len(seeds)}seed{'s' if len(seeds) > 1 else ''}"
-        plot_learnable_vs_baseline(
-            base_res, learn_res,
-            FIG_LEARNABLE_DIR / f"baseline_vs_learnable_{n_str}_{decay_tag}{ep_tag}.jpg",
-            decay_tag, n_ep=n_ep_target,
-        )
+        dqn_ckpt_dir = ROOT / "paper" / "_tmp_dqn_ctrl" / f"ckpt_{decay_tag}"
+        dqn_seeds = [s for s in DEFAULT_SEEDS if (dqn_ckpt_dir / f"dqn_base_soft_seed{s}.pt").exists()]
+        if dqn_seeds:
+            dqn_res = [_load_dqn_base(dqn_ckpt_dir, s) for s in dqn_seeds]
+            plot_learnable_vs_dqn(
+                learn_res, dqn_res,
+                FIG_LEARNABLE_DIR / f"baseline_vs_learnable_{n_str}_{decay_tag}{ep_tag}.jpg",
+                decay_tag, n_ep=n_ep_target,
+            )
+        else:
+            plot_learnable_vs_baseline(
+                base_res, learn_res,
+                FIG_LEARNABLE_DIR / f"baseline_vs_learnable_{n_str}_{decay_tag}{ep_tag}.jpg",
+                decay_tag, n_ep=n_ep_target,
+            )
         plot_gate_params_history(
             learn_res,
             FIG_LEARNABLE_DIR / f"gate_params_history_{n_str}_{decay_tag}{ep_tag}.jpg",
+        )
+        return
+
+    if args.learnable_bounded_lr:
+        ep_tag = f"_ep{n_ep_target}" if n_ep_target is not None else ""
+        bdlr_ckpt_dir = ROOT / "paper" / "_tmp_b_feedb_cg" / f"ckpt_learnable_bdlr_{decay_tag}{ep_tag}"
+        # Reuse the baseline from the original learnable run
+        orig_ckpt_dir = ROOT / "paper" / "_tmp_b_feedb_cg" / f"ckpt_learnable_{decay_tag}{ep_tag}"
+        orig_base_dir = (
+            ROOT / "paper" / "_tmp_b_feedb_cg" / f"ckpt_learnable_{decay_tag}"
+            if n_ep_target is not None else orig_ckpt_dir
+        )
+
+        if not args.plot_only:
+            bdlr_seeds_to_run = [
+                s for s in seeds if not _ckpt_path_learnable(bdlr_ckpt_dir, s).exists()
+            ] if args.train_missing_only else list(seeds)
+            if bdlr_seeds_to_run:
+                ep_str = f"up to {n_ep_target:,} ep" if n_ep_target else f"{n_step:,} steps"
+                print(f"\n>>> [LEARNABLE-BDLR] Training seeds {bdlr_seeds_to_run} for {ep_str} ...", flush=True)
+                t0 = time.perf_counter()
+                for seed in bdlr_seeds_to_run:
+                    run_one(seed, n_step, True, device,
+                            checkpoint_dir=bdlr_ckpt_dir,
+                            epsilon_decay_episodes=eps_decay_ep,
+                            total_episodes=n_ep_target,
+                            learnable_gate=True)
+                print(f">>> [LEARNABLE-BDLR] Done in {time.perf_counter() - t0:.1f}s", flush=True)
+            else:
+                print(">>> LEARNABLE-BDLR: all checkpoints present, skipping.", flush=True)
+
+        for seed in seeds:
+            if not _ckpt_path_learnable(bdlr_ckpt_dir, seed).exists():
+                raise FileNotFoundError(
+                    f"Missing bounded-lr learnable checkpoint for seed {seed} in {bdlr_ckpt_dir}"
+                )
+
+        new_res = [_load_result_learnable(bdlr_ckpt_dir, s) for s in seeds]
+
+        # Load matching old-learnable results for the same seeds (if available)
+        old_seeds = [s for s in seeds if _ckpt_path_learnable(orig_ckpt_dir, s).exists()]
+        if not old_seeds:
+            # Fall back to step-cap dir
+            old_seeds = [s for s in seeds if _ckpt_path_learnable(orig_base_dir, s).exists()]
+            old_dir = orig_base_dir
+        else:
+            old_dir = orig_ckpt_dir
+        old_res = [_load_result_learnable(old_dir, s) for s in old_seeds] if old_seeds else []
+
+        dqn_ckpt_dir = ROOT / "paper" / "_tmp_dqn_ctrl" / f"ckpt_{decay_tag}"
+        dqn_seeds    = [s for s in DEFAULT_SEEDS if (dqn_ckpt_dir / f"dqn_base_soft_seed{s}.pt").exists()]
+        dqn_res      = [_load_dqn_base(dqn_ckpt_dir, s) for s in dqn_seeds] if dqn_seeds else []
+
+        print("\n=== Final-100-episode summary (bounded-lr learnable gate) ===", flush=True)
+        _agg_print(new_res, "learnable gate (bdlr)")
+        if old_res:
+            _agg_print(old_res, "learnable gate (original)")
+        if dqn_res:
+            _agg_print(dqn_res, "DQN baseline")
+
+        n_str = f"{len(seeds)}seed{'s' if len(seeds) > 1 else ''}"
+        if old_res and dqn_res:
+            plot_learnable_compare(
+                old_res, new_res, dqn_res,
+                FIG_LEARNABLE_DIR / f"learnable_bdlr_compare_{n_str}_{decay_tag}{ep_tag}.jpg",
+                decay_tag, n_ep=n_ep_target,
+            )
+        elif dqn_res:
+            plot_learnable_vs_dqn(
+                new_res, dqn_res,
+                FIG_LEARNABLE_DIR / f"learnable_bdlr_compare_{n_str}_{decay_tag}{ep_tag}.jpg",
+                decay_tag, n_ep=n_ep_target,
+            )
+        plot_gate_params_history(
+            new_res,
+            FIG_LEARNABLE_DIR / f"gate_params_history_bdlr_{n_str}_{decay_tag}{ep_tag}.jpg",
         )
         return
 
