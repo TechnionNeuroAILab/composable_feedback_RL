@@ -462,6 +462,7 @@ def run_inner_task(
     learning_starts: int = LEARNING_STARTS,
     fixed_knobs: Optional[Dict] = None,
     deterministic_ctrl: bool = False,
+    total_episodes: Optional[int] = None,
 ) -> Dict:
     """
     Train a fresh DQN on one task. If use_controller, sample knobs via the
@@ -506,9 +507,12 @@ def run_inner_task(
     pending_value: Optional[torch.Tensor] = None
     pending_entropy: Optional[torch.Tensor] = None
 
+    step_cap = max(inner_steps, 15_000_000) if total_episodes is not None else inner_steps
     obs, _ = env.reset(seed=seed)
     t = 0
-    while t < inner_steps:
+    while t < step_cap and (
+        total_episodes is None or len(episode_returns) < total_episodes
+    ):
         n_ep = len(episode_returns)
         eps = _linear_schedule(START_E, eps_end, epsilon_decay_episodes, n_ep)
         action = agent.act(obs, eps)
@@ -562,7 +566,11 @@ def run_inner_task(
                 pending_value = None
                 pending_entropy = None
 
-            progress = t / max(1, inner_steps)
+            progress = (
+                len(episode_returns) / max(1, total_episodes)
+                if total_episodes is not None
+                else t / max(1, inner_steps)
+            )
             state = build_meta_state(
                 loss_ema,
                 grad_ema,
@@ -621,6 +629,13 @@ def run_inner_task(
 
         t += 1
 
+    if total_episodes is not None and len(episode_returns) < total_episodes:
+        print(
+            f"  WARNING {env_id}: hit step cap {step_cap:,} "
+            f"with only {len(episode_returns)}/{total_episodes} episodes",
+            flush=True,
+        )
+
     env.close()
 
     if use_controller and pending_log_prob is not None and return_ema_ready:
@@ -667,6 +682,7 @@ def run_meta_train(
     seed: int,
     device: torch.device,
     checkpoint_dir: Path,
+    total_episodes: Optional[int] = None,
 ) -> Dict:
     _set_seed(seed)
     n_tasks = len(tasks)
@@ -680,7 +696,11 @@ def run_meta_train(
     print("confgate_meta_hpo — multi-task meta-RL HPO", flush=True)
     print(f"  Tasks       : {list(tasks)}", flush=True)
     print(f"  Meta iters  : {meta_iters}", flush=True)
-    print(f"  Inner steps : {inner_steps:,}", flush=True)
+    if total_episodes is not None:
+        step_cap = max(inner_steps, 15_000_000)
+        print(f"  Episodes    : {total_episodes:,} (step cap {step_cap:,})", flush=True)
+    else:
+        print(f"  Inner steps : {inner_steps:,}", flush=True)
     print(f"  Seed        : {seed}", flush=True)
     print(f"  Device      : {device}", flush=True)
     print("=" * 60, flush=True)
@@ -705,6 +725,7 @@ def run_meta_train(
             inner_steps=inner_steps,
             seed=inner_seed,
             use_controller=True,
+            total_episodes=total_episodes,
         )
         per_task_curves[env_id].append(result["episode_returns"])
         history.append(
@@ -738,6 +759,7 @@ def run_meta_train(
             "seed": seed,
             "meta_iters": meta_iters,
             "inner_steps": inner_steps,
+            "total_episodes": total_episodes,
             "history": history,
             "per_task_curves": per_task_curves,
         },
@@ -752,6 +774,7 @@ def run_meta_train(
         "tasks": list(tasks),
         "meta_iters": meta_iters,
         "inner_steps": inner_steps,
+        "total_episodes": total_episodes,
         "history": [
             {
                 k: v
@@ -782,6 +805,7 @@ def run_eval_vs_baseline(
     device: torch.device,
     checkpoint_dir: Path,
     deterministic_ctrl: bool = True,
+    total_episodes: Optional[int] = None,
 ) -> Dict[str, Dict[str, Dict]]:
     """
     For each task, run fixed-hparam baseline and (if controller) meta-controlled
@@ -813,6 +837,7 @@ def run_eval_vs_baseline(
             use_controller=False,
             update_controller=False,
             fixed_knobs=fixed,
+            total_episodes=total_episodes,
         )
         results[env_id]["baseline"] = base
 
@@ -828,6 +853,7 @@ def run_eval_vs_baseline(
             use_controller=True,
             update_controller=False,
             deterministic_ctrl=deterministic_ctrl,
+            total_episodes=total_episodes,
         )
         results[env_id]["meta"] = meta
 
@@ -933,6 +959,154 @@ def plot_knob_trajectories(
     print(f"Wrote {out_jpg}", flush=True)
 
 
+def _interp_hist(hist: List[Dict], x_key: str, y_key: str, grid: np.ndarray) -> np.ndarray:
+    xs = np.array([float(h[x_key]) for h in hist])
+    ys = np.array([float(h[y_key]) for h in hist])
+    order = np.argsort(xs)
+    xs, ys = xs[order], ys[order]
+    ux: List[float] = []
+    uy: List[float] = []
+    for x, y in zip(xs, ys):
+        if ux and abs(x - ux[-1]) < 1e-9:
+            uy[-1] = float(y)
+        else:
+            ux.append(float(x))
+            uy.append(float(y))
+    return np.interp(grid, np.asarray(ux), np.asarray(uy), left=float("nan"), right=float("nan"))
+
+
+def _filter_results(
+    results: Dict[str, Dict[str, Dict]], tasks: Sequence[str]
+) -> Dict[str, Dict[str, Dict]]:
+    return {t: results[t] for t in tasks if t in results}
+
+
+def plot_eval_curves_multi_seed(
+    all_results: List[Dict[str, Dict[str, Dict]]],
+    out_jpg: Path,
+    title_suffix: str = "",
+) -> None:
+    """Per-seed learning curves (semi-transparent) + bold mean (one panel per task)."""
+    if not all_results:
+        return
+    tasks = list(all_results[0].keys())
+    n_seeds = len(all_results)
+    fig, axes = plt.subplots(1, len(tasks), figsize=(5 * len(tasks), 4), squeeze=False)
+
+    for ax, env_id in zip(axes[0], tasks):
+        for tag, color, label in (
+            ("baseline", COLOR_BASE, "fixed hparams"),
+            ("meta", COLOR_META, "meta-RL ctrl"),
+        ):
+            arrays = [
+                np.asarray(r[env_id][tag]["episode_returns"], dtype=np.float64)
+                for r in all_results
+                if env_id in r and tag in r[env_id]
+            ]
+            if not arrays:
+                continue
+            n = min(len(a) for a in arrays)
+            M = np.stack([a[:n] for a in arrays], axis=0)
+            mu = M.mean(0)
+            w = max(1, n // 50)
+            ep_sm = np.arange(w, n + 1)
+            sm_mu = _smooth(mu, w)
+            l100 = float(
+                np.mean(
+                    [
+                        r[env_id][tag]["last100_mean"]
+                        for r in all_results
+                        if env_id in r and tag in r[env_id]
+                    ]
+                )
+            )
+            for arr in arrays:
+                sm = _smooth(arr[:n], w)
+                ax.plot(
+                    ep_sm,
+                    sm,
+                    color=color,
+                    alpha=0.35,
+                    lw=1.0,
+                    zorder=1,
+                )
+            ax.plot(
+                ep_sm,
+                sm_mu,
+                color=color,
+                lw=3.0,
+                label=f"{label} mean (last100={l100:.1f})",
+                zorder=2,
+            )
+        ax.set_title(env_id, fontsize=11)
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Episodic return")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, loc="best")
+
+    fig.suptitle(
+        f"Meta-HPO vs fixed hparams ({n_seeds} seeds, faint=individual, bold=mean){title_suffix}",
+        fontsize=12,
+        y=1.02,
+    )
+    out_jpg.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_jpg, dpi=150, bbox_inches="tight", format="jpeg")
+    plt.close(fig)
+    print(f"Wrote {out_jpg}", flush=True)
+
+
+def plot_knob_trajectories_multi_seed(
+    all_results: List[Dict[str, Dict[str, Dict]]],
+    out_jpg: Path,
+) -> None:
+    """Per-seed knob trajectories (semi-transparent) + bold mean."""
+    if not all_results:
+        return
+    tasks = list(all_results[0].keys())
+    keys = ["lr_mult", "eps_end", "train_freq", "target_freq"]
+    seed_cmap = plt.get_cmap("tab10")
+    fig, axes = plt.subplots(
+        len(keys), len(tasks), figsize=(4.5 * len(tasks), 2.2 * len(keys)), squeeze=False
+    )
+
+    for col, env_id in enumerate(tasks):
+        hists = [
+            r[env_id]["meta"].get("knob_history", [])
+            for r in all_results
+            if env_id in r and "meta" in r[env_id] and r[env_id]["meta"].get("knob_history")
+        ]
+        if not hists:
+            continue
+        starts = [float(h[0]["step"]) for h in hists]
+        ends = [float(h[-1]["step"]) for h in hists]
+        lo, hi = max(starts), min(ends)
+        if hi <= lo:
+            continue
+        grid = np.linspace(lo, hi, 200)
+        for row, key in enumerate(keys):
+            ax = axes[row][col]
+            rows = np.vstack([_interp_hist(h, "step", key, grid) for h in hists])
+            mu = np.nanmean(rows, axis=0)
+            for i, row_vals in enumerate(rows):
+                ax.plot(grid, row_vals, color=seed_cmap(i % 10), alpha=0.35, lw=0.9, zorder=1)
+            ax.plot(grid, mu, color=COLOR_META, lw=2.5, zorder=2)
+            ax.set_ylabel(key, fontsize=8)
+            ax.grid(True, alpha=0.3)
+            if row == 0:
+                ax.set_title(env_id, fontsize=10)
+            if row == len(keys) - 1:
+                ax.set_xlabel("Inner step", fontsize=9)
+
+    fig.suptitle(
+        f"Hyperparameter trajectories (meta-RL, {len(all_results)} seeds, faint=individual, bold=mean)",
+        fontsize=12,
+    )
+    out_jpg.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_jpg, dpi=150, bbox_inches="tight", format="jpeg")
+    plt.close(fig)
+    print(f"Wrote {out_jpg}", flush=True)
+
+
 def plot_meta_train_progress(history: List[Dict], out_jpg: Path) -> None:
     if not history:
         return
@@ -970,6 +1144,13 @@ def main() -> None:
     )
     p.add_argument("--meta-iters", type=int, default=DEFAULT_META_ITERS)
     p.add_argument("--inner-steps", type=int, default=DEFAULT_INNER_STEPS)
+    p.add_argument(
+        "--total-episodes",
+        type=int,
+        default=None,
+        metavar="E",
+        help="stop each eval inner run after E completed episodes (meta-train uses --inner-steps)",
+    )
     p.add_argument("--seeds", type=str, default=",".join(map(str, DEFAULT_SEEDS)))
     p.add_argument(
         "--eval-only",
@@ -991,13 +1172,33 @@ def main() -> None:
         action="store_true",
         help="Skip meta-train if controller checkpoint already exists",
     )
+    p.add_argument(
+        "--aggregate-only",
+        action="store_true",
+        help="Skip per-seed figures; write multi-seed aggregate plots only",
+    )
+    p.add_argument(
+        "--reuse-eval-seeds",
+        type=str,
+        default="",
+        help="Comma-separated seeds whose eval checkpoints are reused as-is (skip re-eval)",
+    )
     args = p.parse_args()
 
     tasks = _parse_list(args.tasks)
     seeds = _parse_seeds(args.seeds)
+    reuse_eval_seeds = set(_parse_seeds(args.reuse_eval_seeds)) if args.reuse_eval_seeds else set()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    n_seeds_tag = f"{len(seeds)}seeds"
+    budget_tag = (
+        f"ep{args.total_episodes}"
+        if args.total_episodes is not None
+        else f"inner{args.inner_steps}"
+    )
+    all_eval_results: List[Dict[str, Dict[str, Dict]]] = []
 
     for seed in seeds:
         ckpt_path = CKPT_DIR / f"meta_controller_seed{seed}.pt"
@@ -1010,24 +1211,25 @@ def main() -> None:
             if not eval_path.exists():
                 raise FileNotFoundError(f"Missing eval checkpoint: {eval_path}")
             blob = torch.load(eval_path, map_location="cpu", weights_only=False)
-            results = blob["results"]
-            # wrap into expected shape for plotting
-            plot_eval_curves(
-                results,
-                FIG_DIR / f"meta_vs_baseline_seed{seed}.jpg",
-                title_suffix=f" (seed={seed})",
-            )
-            plot_knob_trajectories(
-                results, FIG_DIR / f"knob_trajectories_seed{seed}.jpg"
-            )
-            if ckpt_path.exists():
-                train_blob = torch.load(
-                    ckpt_path, map_location="cpu", weights_only=False
+            results = _filter_results(blob["results"], tasks)
+            all_eval_results.append(results)
+            if not args.aggregate_only:
+                plot_eval_curves(
+                    results,
+                    FIG_DIR / f"meta_vs_baseline_seed{seed}.jpg",
+                    title_suffix=f" (seed={seed})",
                 )
-                plot_meta_train_progress(
-                    train_blob.get("history", []),
-                    FIG_DIR / f"meta_train_progress_seed{seed}.jpg",
+                plot_knob_trajectories(
+                    results, FIG_DIR / f"knob_trajectories_seed{seed}.jpg"
                 )
+                if ckpt_path.exists():
+                    train_blob = torch.load(
+                        ckpt_path, map_location="cpu", weights_only=False
+                    )
+                    plot_meta_train_progress(
+                        train_blob.get("history", []),
+                        FIG_DIR / f"meta_train_progress_seed{seed}.jpg",
+                    )
             continue
 
         if not args.eval_only:
@@ -1046,6 +1248,7 @@ def main() -> None:
                     seed=seed,
                     device=device,
                     checkpoint_dir=CKPT_DIR,
+                    total_episodes=None,
                 )
                 controller = train_out["controller"]
                 history = train_out["history"]
@@ -1061,7 +1264,15 @@ def main() -> None:
             controller.load_state_dict(blob["controller"])
             history = blob.get("history", [])
 
-        if args.skip_eval:
+        if args.skip_eval or seed in reuse_eval_seeds:
+            if seed in reuse_eval_seeds:
+                if not eval_path.exists():
+                    raise FileNotFoundError(
+                        f"--reuse-eval-seeds includes {seed} but missing: {eval_path}"
+                    )
+                blob = torch.load(eval_path, map_location="cpu", weights_only=False)
+                all_eval_results.append(_filter_results(blob["results"], tasks))
+                print(f"Reusing eval checkpoint for seed {seed}: {eval_path}", flush=True)
             continue
 
         results = run_eval_vs_baseline(
@@ -1072,14 +1283,35 @@ def main() -> None:
             device=device,
             checkpoint_dir=CKPT_DIR,
             deterministic_ctrl=True,
+            total_episodes=args.total_episodes,
         )
-        plot_eval_curves(
-            results,
-            FIG_DIR / f"meta_vs_baseline_seed{seed}.jpg",
-            title_suffix=f" (seed={seed}, inner={args.inner_steps})",
+        results = _filter_results(results, tasks)
+        if not args.aggregate_only:
+            budget_suffix = (
+                f"ep={args.total_episodes}"
+                if args.total_episodes is not None
+                else f"inner={args.inner_steps}"
+            )
+            plot_eval_curves(
+                results,
+                FIG_DIR / f"meta_vs_baseline_seed{seed}.jpg",
+                title_suffix=f" (seed={seed}, {budget_suffix})",
+            )
+            plot_knob_trajectories(
+                results, FIG_DIR / f"knob_trajectories_seed{seed}.jpg"
+            )
+        all_eval_results.append(results)
+
+    if all_eval_results and len(all_eval_results) > 1:
+        n_seeds_tag = f"{len(all_eval_results)}seeds"
+        plot_eval_curves_multi_seed(
+            all_eval_results,
+            FIG_DIR / f"meta_vs_baseline_{budget_tag}_{n_seeds_tag}.jpg",
+            title_suffix=f" ({budget_tag})",
         )
-        plot_knob_trajectories(
-            results, FIG_DIR / f"knob_trajectories_seed{seed}.jpg"
+        plot_knob_trajectories_multi_seed(
+            all_eval_results,
+            FIG_DIR / f"knob_trajectories_{budget_tag}_{n_seeds_tag}.jpg",
         )
 
 

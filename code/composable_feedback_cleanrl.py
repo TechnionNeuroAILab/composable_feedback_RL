@@ -110,6 +110,11 @@ class ReplayBuffer:
         self.buffer_size = buffer_size
         self.pos = 0
         self.full = False
+        
+        # Handle scalar observations (discrete spaces like FrozenLake)
+        if obs_shape == ():
+            obs_shape = (1,)
+        self.obs_shape = obs_shape
 
         self.obs = np.zeros((buffer_size, *obs_shape), dtype=np.float32)
         self.next_obs = np.zeros((buffer_size, *obs_shape), dtype=np.float32)
@@ -118,6 +123,14 @@ class ReplayBuffer:
         self.dones = np.zeros((buffer_size,), dtype=np.float32)
 
     def add(self, obs, next_obs, action, reward, done):
+        # Handle scalar observations
+        obs = np.array(obs, dtype=np.float32)
+        if obs.shape == ():
+            obs = obs.reshape(1)
+        next_obs = np.array(next_obs, dtype=np.float32)
+        if next_obs.shape == ():
+            next_obs = next_obs.reshape(1)
+        
         self.obs[self.pos] = obs
         self.next_obs[self.pos] = next_obs
         self.actions[self.pos] = action
@@ -281,11 +294,11 @@ def compute_outcomes_b(
     B = rewards.shape[0]
     o = torch.zeros((B, num_outcomes), device=rewards.device, dtype=torch.float32)
     o[:, 0] = rewards
-    if num_outcomes >= 2:
-        # CartPole obs: [x, x_dot, theta, theta_dot]
+    if num_outcomes >= 2 and next_obs.shape[1] >= 3:
+        # CartPole obs: [x, x_dot, theta, theta_dot] - only use if obs has >= 3 dims
         theta = next_obs[:, 2]
         o[:, 1] = -theta.abs().clamp(max=0.5)  # bounded auxiliary outcome
-    # if more heads requested, leave as zeros (user can customize)
+    # if more heads requested or obs doesn't have enough dims, leave as zeros (user can customize)
     return o
 
 
@@ -316,7 +329,12 @@ def main():
     env = make_env(args.env_id, args.seed)
     assert isinstance(env.action_space, gym.spaces.Discrete), "Only discrete action spaces supported."
 
-    obs_dim = int(np.prod(env.observation_space.shape))
+    # Handle scalar observations (discrete spaces like FrozenLake-v1)
+    obs_shape = env.observation_space.shape
+    if obs_shape == ():
+        obs_dim = 1
+    else:
+        obs_dim = int(np.prod(obs_shape))
     n_actions = env.action_space.n
 
     # build model(s)
@@ -336,9 +354,17 @@ def main():
     target_net.load_state_dict(q_net.state_dict())
     optimizer = optim.Adam(q_net.parameters(), lr=args.learning_rate)
 
-    rb = ReplayBuffer(env.observation_space.shape, args.buffer_size, device=device)
+    # Handle scalar observations for replay buffer
+    obs_shape = env.observation_space.shape
+    if obs_shape == ():
+        obs_shape = (1,)
+    rb = ReplayBuffer(obs_shape, args.buffer_size, device=device)
 
     obs, _ = env.reset(seed=args.seed)
+    # Normalize observation shape for discrete spaces
+    obs = np.array(obs, dtype=np.float32)
+    if obs.shape == ():
+        obs = obs.reshape(1)
     episode_return = 0.0
     episode_length = 0
     start_time = time.time()
@@ -351,17 +377,31 @@ def main():
             action = env.action_space.sample()
         else:
             with torch.no_grad():
-                obs_t = torch.tensor(obs, device=device, dtype=torch.float32).unsqueeze(0)
+                # Handle scalar observations (discrete spaces like FrozenLake)
+                obs_array = np.array(obs, dtype=np.float32)
+                if obs_array.shape == ():
+                    obs_array = obs_array.reshape(1)
+                obs_t = torch.tensor(obs_array, device=device, dtype=torch.float32).unsqueeze(0)
+                
                 if args.option == "standard":
                     q_vals = q_net(obs_t)  # [1,A]
                 elif args.option == "a":
                     q_vals = q_net(obs_t)  # [1,A]
                 elif args.option == "b":
                     q_heads = q_net(obs_t)  # [1,K,A]
-                    q_vals = q_heads[:, args.policy_outcome_idx, :]  # policy uses one head
+                    # Handle case where q_heads might be 2D for discrete spaces
+                    if q_heads.dim() == 2:
+                        q_vals = q_heads  # [1,A] - single head case
+                    else:
+                        q_vals = q_heads[:, args.policy_outcome_idx, :]  # policy uses one head
                 else:  # c, c_local, or d
                     q_vals = q_net.q_total(obs_t)  # [1,A]
-                action = int(torch.argmax(q_vals, dim=1).item())
+                
+                # Handle both 1D and 2D q_vals
+                if q_vals.dim() == 1:
+                    action = int(torch.argmax(q_vals, dim=0).item())
+                else:
+                    action = int(torch.argmax(q_vals, dim=1).item())
 
         next_obs, reward, terminated, truncated, info = env.step(action)
         done = bool(terminated or truncated)
@@ -377,6 +417,10 @@ def main():
             writer.add_scalar("charts/episodic_return", episode_return, global_step)
             writer.add_scalar("charts/episodic_length", episode_length, global_step)
             obs, _ = env.reset(seed=args.seed)
+            # Normalize observation shape for discrete spaces
+            obs = np.array(obs, dtype=np.float32)
+            if obs.shape == ():
+                obs = obs.reshape(1)
             episode_return = 0.0
             episode_length = 0
 
@@ -436,10 +480,25 @@ def main():
                     # local vectorial errors: explicitly compute δ_i = y_i - q_i and use each element locally
                     delta_i = y_i - q_i  # [B, F] - explicit vectorial error
                     loss_i = delta_i ** 2  # [B, F] - per-feature squared errors
-                    loss = loss_i.sum(dim=1).mean()  # sum over features, mean over batch
+                    feature_loss = loss_i.sum(dim=1).mean()  # sum over features, mean over batch
+                    # Add bias loss: ensure bias is updated by computing total Q error
+                    # Total Q: sum_i Q_i(s,a) + b_a, Target: sum_i y_i + γ b_{a*}
+                    q_total = q_i.sum(dim=1) + q_net.b[b_actions]  # [B]
+                    y_total = y_i.sum(dim=1) + args.gamma * target_net.b[a_star] * (1.0 - b_dones)  # [B] - include bias from next state
+                    bias_loss = F.mse_loss(q_total, y_total)  # total Q error to update bias
+                    loss = feature_loss + bias_loss  # combine feature and bias losses
                 else:  # d
                     # local update: per-feature loss uses vector PEs directly
-                    loss = F.mse_loss(q_i, y_i)
+                    # Compute sum_i E[δ_i^2]: mean over batch per feature, then sum over features
+                    delta_i = y_i - q_i  # [B, F]
+                    loss_i = delta_i ** 2  # [B, F]
+                    feature_loss = loss_i.mean(dim=0).sum()  # mean over batch (per feature), then sum over features
+                    # Add bias loss: ensure bias is updated by computing total Q error
+                    # Total Q: sum_i Q_i(s,a) + b_a, Target: sum_i y_i + γ b_{a*}
+                    q_total = q_i.sum(dim=1) + q_net.b[b_actions]  # [B]
+                    y_total = y_i.sum(dim=1) + args.gamma * target_net.b[a_star] * (1.0 - b_dones)  # [B] - include bias from next state
+                    bias_loss = F.mse_loss(q_total, y_total)  # total Q error to update bias
+                    loss = feature_loss + bias_loss  # combine feature and bias losses
 
             optimizer.zero_grad()
             loss.backward()
