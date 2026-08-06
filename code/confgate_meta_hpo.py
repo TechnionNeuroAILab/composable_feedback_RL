@@ -3,8 +3,9 @@ Multi-task meta-RL hyperparameter controller for DQN.
 
 Outer loop: sample a task, keep a shared GRU controller.
 Inner loop: fresh DQN per task; controller samples major training knobs
-            (lr_mult, eps_end, train_freq, target_freq) applied to Adam /
-            schedules (never via loss scaling). Controller trained with
+            (all categorical): lr_mult, eps_end, eps_start,
+            epsilon_decay_episodes, train_freq, target_freq — applied to Adam /
+            ε-schedules (never via loss scaling). Controller trained with
             REINFORCE + value baseline on return-improvement reward.
 
 Tasks (default): CartPole-v1, Acrobot-v1, MountainCar-v0
@@ -36,7 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Categorical, Normal
+from torch.distributions import Categorical
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -70,24 +71,44 @@ DEFAULT_META_ITERS = 50
 DEFAULT_INNER_STEPS = 50_000
 META_INTERVAL = 64  # env steps between controller actions / rewards
 CTRL_LR = 1e-3
-ENTROPY_COEF = 0.01
+ENTROPY_COEF = 0.05  # higher: six categorical heads need more exploration
 VALUE_COEF = 0.5
 STEP_COST = 0.01
 RETURN_EMA_ALPHA = 0.1
 META_REWARD_CLIP = 5.0  # clip Δreturn reward for PG stability across tasks
+HEAD_BIAS_PREF = 0.5  # mild prior toward CleanRL-ish defaults (weights not zeroed)
 
 TRAIN_FREQ_CHOICES = [1, 2, 4, 8, 10]
 TARGET_FREQ_CHOICES = [1, 50, 100, 250, 500]
 
-LR_MULT_LO, LR_MULT_HI = 0.1, 3.0
-EPS_END_LO, EPS_END_HI = 0.01, 0.2
+# 10-way grids for formerly continuous / fixed ε schedule knobs
+LR_MULT_CHOICES = [0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
+EPS_END_CHOICES = [0.01, 0.02, 0.03, 0.05, 0.07, 0.1, 0.12, 0.15, 0.18, 0.2]
+EPS_START_CHOICES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+EPS_DECAY_EPISODES_CHOICES = [50, 100, 200, 350, 500, 750, 1000, 1500, 2000, 3500]
+
+LR_MULT_LO, LR_MULT_HI = float(LR_MULT_CHOICES[0]), float(LR_MULT_CHOICES[-1])
+EPS_END_LO, EPS_END_HI = float(EPS_END_CHOICES[0]), float(EPS_END_CHOICES[-1])
+EPS_START_LO, EPS_START_HI = float(EPS_START_CHOICES[0]), float(EPS_START_CHOICES[-1])
+EPS_DECAY_LO = float(EPS_DECAY_EPISODES_CHOICES[0])
+EPS_DECAY_HI = float(EPS_DECAY_EPISODES_CHOICES[-1])
 
 COLOR_BASE = "#2ca02c"
 COLOR_META = "#ff7f0e"
 
+KNOB_PLOT_KEYS = [
+    "lr_mult",
+    "eps_end",
+    "eps_start",
+    "epsilon_decay_episodes",
+    "train_freq",
+    "target_freq",
+]
+
 # Meta-state layout (no task emb):
-#   loss_ema, grad_ema, return_ema, eps, progress, lr_mult, train_freq_n, target_freq_n
-BASE_STATE_DIM = 8
+#   loss, grad, return, eps, progress,
+#   lr_n, eps_end_n, eps_start_n, eps_decay_n, train_freq_n, target_freq_n
+BASE_STATE_DIM = 11
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +137,15 @@ def _parse_list(s: str) -> List[str]:
 
 def _parse_seeds(s: str) -> List[int]:
     return sorted({int(p.strip()) for p in s.split(",") if p.strip()})
+
+
+def _nearest_choice_idx(choices: Sequence[float], value: float) -> int:
+    return int(np.argmin([abs(float(c) - float(value)) for c in choices]))
+
+
+def _choice_norm(choices: Sequence[float], value: float) -> float:
+    idx = _nearest_choice_idx(choices, value)
+    return idx / max(1, len(choices) - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +260,8 @@ class MetaAction:
     __slots__ = (
         "lr_mult",
         "eps_end",
+        "eps_start",
+        "epsilon_decay_episodes",
         "train_freq",
         "target_freq",
         "log_prob",
@@ -241,6 +273,8 @@ class MetaAction:
         self,
         lr_mult: float,
         eps_end: float,
+        eps_start: float,
+        epsilon_decay_episodes: int,
         train_freq: int,
         target_freq: int,
         log_prob: torch.Tensor,
@@ -249,6 +283,8 @@ class MetaAction:
     ):
         self.lr_mult = lr_mult
         self.eps_end = eps_end
+        self.eps_start = eps_start
+        self.epsilon_decay_episodes = epsilon_decay_episodes
         self.train_freq = train_freq
         self.target_freq = target_freq
         self.log_prob = log_prob
@@ -258,8 +294,9 @@ class MetaAction:
 
 class MetaHPOController(nn.Module):
     """
-    GRU policy: continuous lr_mult / eps_end + categorical train/target freqs.
-    State = base features + task embedding.
+    GRU policy with all-categorical knob heads:
+      lr_mult, eps_end, eps_start, epsilon_decay_episodes, train_freq, target_freq.
+    Weights keep default Linear init (not zeroed); mild bias prior toward baselines.
     """
 
     def __init__(self, n_tasks: int, state_dim: int = BASE_STATE_DIM):
@@ -270,44 +307,39 @@ class MetaHPOController(nn.Module):
         in_dim = state_dim + TASK_EMB_DIM
         self.gru = nn.GRUCell(in_dim, CTRL_HIDDEN)
         self.trunk = nn.Sequential(nn.Linear(CTRL_HIDDEN, CTRL_HIDDEN), nn.ReLU())
-        # Continuous: raw params → (mu_lr, log_std_lr, mu_eps, log_std_eps)
-        self.cont_head = nn.Linear(CTRL_HIDDEN, 4)
+        self.lr_head = nn.Linear(CTRL_HIDDEN, len(LR_MULT_CHOICES))
+        self.eps_end_head = nn.Linear(CTRL_HIDDEN, len(EPS_END_CHOICES))
+        self.eps_start_head = nn.Linear(CTRL_HIDDEN, len(EPS_START_CHOICES))
+        self.eps_decay_head = nn.Linear(CTRL_HIDDEN, len(EPS_DECAY_EPISODES_CHOICES))
         self.tf_head = nn.Linear(CTRL_HIDDEN, len(TRAIN_FREQ_CHOICES))
         self.tgt_head = nn.Linear(CTRL_HIDDEN, len(TARGET_FREQ_CHOICES))
         self.value_head = nn.Linear(CTRL_HIDDEN, 1)
-        self._init_biases()
+        self._init_heads()
 
-    def _init_biases(self) -> None:
+    @staticmethod
+    def _soft_prefer(head: nn.Linear, preferred_idx: int) -> None:
+        """Mild logit bias toward a default; leave weight init intact (no pinning)."""
         with torch.no_grad():
-            # Prefer near-baseline at start: lr_mult≈1, eps_end≈0.05
-            # softplus(0.5413)≈1 → map via sigmoid later for bounds
-            self.cont_head.bias.zero_()
-            self.cont_head.bias[0] = 0.0  # logit for mid lr after transform
-            self.cont_head.bias[1] = -1.0  # small log_std
-            self.cont_head.bias[2] = -1.0  # eps toward lower end of range
-            self.cont_head.bias[3] = -1.0
-            nn.init.zeros_(self.cont_head.weight)
-            # Prefer default train_freq=10 (last), target_freq=500 (last)
-            self.tf_head.bias.zero_()
-            self.tf_head.bias[-1] = 1.0
-            self.tgt_head.bias.zero_()
-            self.tgt_head.bias[-1] = 1.0
-            nn.init.zeros_(self.tf_head.weight)
-            nn.init.zeros_(self.tgt_head.weight)
+            head.bias.zero_()
+            if 0 <= preferred_idx < head.bias.numel():
+                head.bias[preferred_idx] = HEAD_BIAS_PREF
+
+    def _init_heads(self) -> None:
+        self._soft_prefer(self.lr_head, LR_MULT_CHOICES.index(1.0))
+        self._soft_prefer(self.eps_end_head, EPS_END_CHOICES.index(0.05))
+        self._soft_prefer(self.eps_start_head, EPS_START_CHOICES.index(1.0))
+        self._soft_prefer(
+            self.eps_decay_head, EPS_DECAY_EPISODES_CHOICES.index(500)
+        )
+        self._soft_prefer(self.tf_head, TRAIN_FREQ_CHOICES.index(DEFAULT_TRAIN_FREQ))
+        self._soft_prefer(
+            self.tgt_head, TARGET_FREQ_CHOICES.index(DEFAULT_TARGET_FREQ)
+        )
 
     def zero_hidden(
         self, batch: int, device: torch.device, dtype: torch.dtype = torch.float32
     ) -> torch.Tensor:
         return torch.zeros(batch, CTRL_HIDDEN, device=device, dtype=dtype)
-
-    @staticmethod
-    def _squash_lr(u: torch.Tensor) -> torch.Tensor:
-        # Map unbounded → [LR_MULT_LO, LR_MULT_HI] via sigmoid
-        return LR_MULT_LO + (LR_MULT_HI - LR_MULT_LO) * torch.sigmoid(u)
-
-    @staticmethod
-    def _squash_eps(u: torch.Tensor) -> torch.Tensor:
-        return EPS_END_LO + (EPS_END_HI - EPS_END_LO) * torch.sigmoid(u)
 
     def act(
         self,
@@ -321,58 +353,37 @@ class MetaHPOController(nn.Module):
         h = self.gru(x, h_prev)
         feat = self.trunk(h)
 
-        cont = self.cont_head(feat)
-        mu_lr, log_std_lr = cont[:, 0], cont[:, 1].clamp(-3.0, 0.5)
-        mu_eps, log_std_eps = cont[:, 2], cont[:, 3].clamp(-3.0, 0.5)
-        std_lr = log_std_lr.exp()
-        std_eps = log_std_eps.exp()
-
-        dist_lr = Normal(mu_lr, std_lr)
-        dist_eps = Normal(mu_eps, std_eps)
-        dist_tf = Categorical(logits=self.tf_head(feat))
-        dist_tgt = Categorical(logits=self.tgt_head(feat))
-
+        dists = (
+            Categorical(logits=self.lr_head(feat)),
+            Categorical(logits=self.eps_end_head(feat)),
+            Categorical(logits=self.eps_start_head(feat)),
+            Categorical(logits=self.eps_decay_head(feat)),
+            Categorical(logits=self.tf_head(feat)),
+            Categorical(logits=self.tgt_head(feat)),
+        )
         if deterministic:
-            u_lr = mu_lr
-            u_eps = mu_eps
-            tf_idx = dist_tf.probs.argmax(dim=-1)
-            tgt_idx = dist_tgt.probs.argmax(dim=-1)
+            idxs = [d.probs.argmax(dim=-1) for d in dists]
         else:
-            u_lr = dist_lr.rsample()
-            u_eps = dist_eps.rsample()
-            tf_idx = dist_tf.sample()
-            tgt_idx = dist_tgt.sample()
+            idxs = [d.sample() for d in dists]
 
-        lr_t = self._squash_lr(u_lr)
-        eps_t = self._squash_eps(u_eps)
-
-        # Change-of-variable ignored for simplicity (bounded via sigmoid of sample)
-        log_prob = (
-            dist_lr.log_prob(u_lr)
-            + dist_eps.log_prob(u_eps)
-            + dist_tf.log_prob(tf_idx)
-            + dist_tgt.log_prob(tgt_idx)
-        )
-        entropy = (
-            dist_lr.entropy()
-            + dist_eps.entropy()
-            + dist_tf.entropy()
-            + dist_tgt.entropy()
-        )
+        log_prob = sum(d.log_prob(i) for d, i in zip(dists, idxs))
+        entropy = sum(d.entropy() for d in dists)
         value = self.value_head(feat).squeeze(-1)
 
-        train_freq = TRAIN_FREQ_CHOICES[int(tf_idx[0].item())]
-        target_freq = TARGET_FREQ_CHOICES[int(tgt_idx[0].item())]
-        # For batch>1 use first for scalar application in single-env loop
-        if state.shape[0] > 1:
-            train_freq = TRAIN_FREQ_CHOICES[int(tf_idx[0].item())]
-            target_freq = TARGET_FREQ_CHOICES[int(tgt_idx[0].item())]
+        i0 = int(idxs[0][0].item())
+        i1 = int(idxs[1][0].item())
+        i2 = int(idxs[2][0].item())
+        i3 = int(idxs[3][0].item())
+        i4 = int(idxs[4][0].item())
+        i5 = int(idxs[5][0].item())
 
         action = MetaAction(
-            lr_mult=float(lr_t[0].item()),
-            eps_end=float(eps_t[0].item()),
-            train_freq=train_freq,
-            target_freq=target_freq,
+            lr_mult=float(LR_MULT_CHOICES[i0]),
+            eps_end=float(EPS_END_CHOICES[i1]),
+            eps_start=float(EPS_START_CHOICES[i2]),
+            epsilon_decay_episodes=int(EPS_DECAY_EPISODES_CHOICES[i3]),
+            train_freq=int(TRAIN_FREQ_CHOICES[i4]),
+            target_freq=int(TARGET_FREQ_CHOICES[i5]),
             log_prob=log_prob,
             entropy=entropy,
             value=value,
@@ -390,23 +401,27 @@ def build_meta_state(
     eps: float,
     progress: float,
     lr_mult: float,
+    eps_end: float,
+    eps_start: float,
+    epsilon_decay_episodes: int,
     train_freq: int,
     target_freq: int,
     device: torch.device,
 ) -> torch.Tensor:
     """Normalize knobs to roughly [0, 1] scales."""
-    tf_n = TRAIN_FREQ_CHOICES.index(train_freq) / max(1, len(TRAIN_FREQ_CHOICES) - 1)
-    tgt_n = TARGET_FREQ_CHOICES.index(target_freq) / max(1, len(TARGET_FREQ_CHOICES) - 1)
     vec = np.array(
         [
-            np.tanh(loss_ema),  # soft-bound loss
+            np.tanh(loss_ema),
             np.tanh(grad_ema / 10.0),
             np.tanh(return_ema / 100.0),
             float(eps),
             float(np.clip(progress, 0.0, 1.0)),
-            (lr_mult - LR_MULT_LO) / (LR_MULT_HI - LR_MULT_LO),
-            tf_n,
-            tgt_n,
+            _choice_norm(LR_MULT_CHOICES, lr_mult),
+            _choice_norm(EPS_END_CHOICES, eps_end),
+            _choice_norm(EPS_START_CHOICES, eps_start),
+            _choice_norm(EPS_DECAY_EPISODES_CHOICES, float(epsilon_decay_episodes)),
+            _choice_norm(TRAIN_FREQ_CHOICES, float(train_freq)),
+            _choice_norm(TARGET_FREQ_CHOICES, float(target_freq)),
         ],
         dtype=np.float32,
     )
@@ -485,10 +500,15 @@ def run_inner_task(
     if fixed_knobs is not None:
         lr_mult = float(fixed_knobs.get("lr_mult", 1.0))
         eps_end = float(fixed_knobs.get("eps_end", END_E))
+        eps_start = float(fixed_knobs.get("eps_start", START_E))
+        epsilon_decay_episodes = int(
+            fixed_knobs.get("epsilon_decay_episodes", epsilon_decay_episodes)
+        )
         train_freq = int(fixed_knobs.get("train_freq", DEFAULT_TRAIN_FREQ))
         target_freq = int(fixed_knobs.get("target_freq", DEFAULT_TARGET_FREQ))
     else:
         lr_mult, eps_end = 1.0, END_E
+        eps_start = START_E
         train_freq, target_freq = DEFAULT_TRAIN_FREQ, DEFAULT_TARGET_FREQ
 
     agent.set_lr(lr_mult)
@@ -514,7 +534,7 @@ def run_inner_task(
         total_episodes is None or len(episode_returns) < total_episodes
     ):
         n_ep = len(episode_returns)
-        eps = _linear_schedule(START_E, eps_end, epsilon_decay_episodes, n_ep)
+        eps = _linear_schedule(eps_start, eps_end, epsilon_decay_episodes, n_ep)
         action = agent.act(obs, eps)
 
         next_obs, reward, terminated, truncated, infos = env.step(action)
@@ -578,6 +598,9 @@ def run_inner_task(
                 eps,
                 progress,
                 lr_mult,
+                eps_end,
+                eps_start,
+                epsilon_decay_episodes,
                 train_freq,
                 target_freq,
                 device,
@@ -597,6 +620,8 @@ def run_inner_task(
                     )
             lr_mult = meta_act.lr_mult
             eps_end = meta_act.eps_end
+            eps_start = meta_act.eps_start
+            epsilon_decay_episodes = meta_act.epsilon_decay_episodes
             train_freq = meta_act.train_freq
             target_freq = meta_act.target_freq
             agent.set_lr(lr_mult)
@@ -609,6 +634,8 @@ def run_inner_task(
                         "episode": len(episode_returns),
                         "lr_mult": lr_mult,
                         "eps_end": eps_end,
+                        "eps_start": eps_start,
+                        "epsilon_decay_episodes": epsilon_decay_episodes,
                         "train_freq": train_freq,
                         "target_freq": target_freq,
                         "return_ema": return_ema,
@@ -683,33 +710,94 @@ def run_meta_train(
     device: torch.device,
     checkpoint_dir: Path,
     total_episodes: Optional[int] = None,
+    tag: str = "",
+    resume: bool = True,
+    save_every: int = 1,
 ) -> Dict:
+    """
+    Train the shared meta-controller for `meta_iters` outer rounds.
+
+    If resume=True and a checkpoint exists with fewer completed rounds, continue
+    from len(history) up to meta_iters (extendable later by raising meta_iters).
+    """
     _set_seed(seed)
     n_tasks = len(tasks)
+    tag_sfx = f"_{tag}" if tag else ""
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = checkpoint_dir / f"meta_controller_seed{seed}{tag_sfx}.pt"
+
     controller = MetaHPOController(n_tasks=n_tasks).to(device)
     opt_ctrl = optim.Adam(controller.parameters(), lr=CTRL_LR)
-
     history: List[Dict] = []
     per_task_curves: Dict[str, List[List[float]]] = {t: [] for t in tasks}
+    start_meta = 0
+
+    if resume and ckpt_path.exists():
+        blob = torch.load(ckpt_path, map_location=device, weights_only=False)
+        if list(blob.get("tasks", [])) != list(tasks):
+            raise ValueError(
+                f"Checkpoint tasks {blob.get('tasks')} != requested {list(tasks)}"
+            )
+        controller.load_state_dict(blob["controller"])
+        if "opt_ctrl" in blob:
+            opt_ctrl.load_state_dict(blob["opt_ctrl"])
+        history = list(blob.get("history", []))
+        per_task_curves = blob.get("per_task_curves", per_task_curves)
+        start_meta = len(history)
+        print(
+            f"Resuming seed={seed} tag={tag or '-'} from meta_iter "
+            f"{start_meta}/{meta_iters} ({ckpt_path})",
+            flush=True,
+        )
+        if start_meta >= meta_iters:
+            print(
+                f"Already at/above target meta_iters={meta_iters}; nothing to train.",
+                flush=True,
+            )
+            return {
+                "controller": controller,
+                "history": history,
+                "per_task_curves": per_task_curves,
+                "ckpt_path": ckpt_path,
+                "completed_meta_iters": start_meta,
+            }
 
     print("=" * 60, flush=True)
     print("confgate_meta_hpo — multi-task meta-RL HPO", flush=True)
     print(f"  Tasks       : {list(tasks)}", flush=True)
-    print(f"  Meta iters  : {meta_iters}", flush=True)
+    print(f"  Meta iters  : {start_meta} → {meta_iters}", flush=True)
     if total_episodes is not None:
-        step_cap = max(inner_steps, 15_000_000)
+        step_cap = max(inner_steps, int(total_episodes) * 2000)
         print(f"  Episodes    : {total_episodes:,} (step cap {step_cap:,})", flush=True)
     else:
         print(f"  Inner steps : {inner_steps:,}", flush=True)
     print(f"  Seed        : {seed}", flush=True)
+    print(f"  Tag         : {tag or '-'}", flush=True)
     print(f"  Device      : {device}", flush=True)
     print("=" * 60, flush=True)
 
+    def _save_ckpt(done_iters: int) -> None:
+        torch.save(
+            {
+                "controller": controller.state_dict(),
+                "opt_ctrl": opt_ctrl.state_dict(),
+                "tasks": list(tasks),
+                "seed": seed,
+                "tag": tag,
+                "meta_iters_target": meta_iters,
+                "meta_iters_done": done_iters,
+                "inner_steps": inner_steps,
+                "total_episodes": total_episodes,
+                "history": history,
+                "per_task_curves": per_task_curves,
+            },
+            ckpt_path,
+        )
+
     t0 = time.perf_counter()
-    # Round-robin with a shuffled order each full cycle (guarantees all tasks)
     task_order = list(range(n_tasks))
     random.shuffle(task_order)
-    for meta_i in range(meta_iters):
+    for meta_i in range(start_meta, meta_iters):
         if meta_i % n_tasks == 0 and meta_i > 0:
             random.shuffle(task_order)
         task_idx = task_order[meta_i % n_tasks]
@@ -746,42 +834,27 @@ def run_meta_train(
             f"ctrl_loss={result['ctrl_loss']:.4f}",
             flush=True,
         )
+        done = meta_i + 1
+        if save_every > 0 and (done % save_every == 0 or done == meta_iters):
+            _save_ckpt(done)
+            print(f"  Checkpoint saved ({done}/{meta_iters}): {ckpt_path}", flush=True)
 
     elapsed = time.perf_counter() - t0
     print(f"Meta-train done in {elapsed:.1f}s", flush=True)
-
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = checkpoint_dir / f"meta_controller_seed{seed}.pt"
-    torch.save(
-        {
-            "controller": controller.state_dict(),
-            "tasks": list(tasks),
-            "seed": seed,
-            "meta_iters": meta_iters,
-            "inner_steps": inner_steps,
-            "total_episodes": total_episodes,
-            "history": history,
-            "per_task_curves": per_task_curves,
-        },
-        ckpt_path,
-    )
+    _save_ckpt(len(history))
     print(f"  Checkpoint: {ckpt_path}", flush=True)
 
-    # Also dump JSON summary (no huge curves)
-    summary_path = checkpoint_dir / f"meta_train_summary_seed{seed}.json"
+    summary_path = checkpoint_dir / f"meta_train_summary_seed{seed}{tag_sfx}.json"
     summary = {
         "seed": seed,
+        "tag": tag,
         "tasks": list(tasks),
         "meta_iters": meta_iters,
+        "meta_iters_done": len(history),
         "inner_steps": inner_steps,
         "total_episodes": total_episodes,
         "history": [
-            {
-                k: v
-                for k, v in h.items()
-                if k != "knob_history"
-            }
-            for h in history
+            {k: v for k, v in h.items() if k != "knob_history"} for h in history
         ],
     }
     summary_path.write_text(json.dumps(summary, indent=2))
@@ -791,6 +864,7 @@ def run_meta_train(
         "history": history,
         "per_task_curves": per_task_curves,
         "ckpt_path": ckpt_path,
+        "completed_meta_iters": len(history),
     }
 
 
@@ -806,6 +880,7 @@ def run_eval_vs_baseline(
     checkpoint_dir: Path,
     deterministic_ctrl: bool = True,
     total_episodes: Optional[int] = None,
+    tag: str = "",
 ) -> Dict[str, Dict[str, Dict]]:
     """
     For each task, run fixed-hparam baseline and (if controller) meta-controlled
@@ -815,6 +890,8 @@ def run_eval_vs_baseline(
     fixed = {
         "lr_mult": 1.0,
         "eps_end": END_E,
+        "eps_start": START_E,
+        "epsilon_decay_episodes": EPSILON_DECAY_EPISODES,
         "train_freq": DEFAULT_TRAIN_FREQ,
         "target_freq": DEFAULT_TARGET_FREQ,
     }
@@ -823,6 +900,10 @@ def run_eval_vs_baseline(
         controller = MetaHPOController(n_tasks=len(tasks)).to(device)
     # lr=0 so accidental step is a no-op; update_controller=False skips backward
     frozen_opt = optim.Adam(controller.parameters(), lr=0.0)
+    tag_sfx = f"_{tag}" if tag else ""
+    # Raise step safety cap when stopping by episodes
+    if total_episodes is not None:
+        inner_steps = max(inner_steps, int(total_episodes) * 2000)
 
     for task_idx, env_id in enumerate(tasks):
         print(f"\n>>> EVAL baseline  {env_id}", flush=True)
@@ -864,19 +945,28 @@ def run_eval_vs_baseline(
         )
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    eval_path = checkpoint_dir / f"eval_vs_baseline_seed{seed}.pt"
+    eval_path = checkpoint_dir / f"eval_vs_baseline_seed{seed}{tag_sfx}.pt"
     serializable = {
         env_id: {
-            tag: {
+            cond: {
                 "episode_returns": res["episode_returns"],
                 "last100_mean": res["last100_mean"],
                 "knob_history": res.get("knob_history", []),
             }
-            for tag, res in tags.items()
+            for cond, res in conds.items()
         }
-        for env_id, tags in results.items()
+        for env_id, conds in results.items()
     }
-    torch.save({"seed": seed, "tasks": list(tasks), "results": serializable}, eval_path)
+    torch.save(
+        {
+            "seed": seed,
+            "tag": tag,
+            "tasks": list(tasks),
+            "total_episodes": total_episodes,
+            "results": serializable,
+        },
+        eval_path,
+    )
     print(f"  Eval checkpoint: {eval_path}", flush=True)
     return results
 
@@ -936,14 +1026,18 @@ def plot_knob_trajectories(
         print("[knob plot] no knob_history — skipping.", flush=True)
         return
 
-    keys = ["lr_mult", "eps_end", "train_freq", "target_freq"]
+    keys = KNOB_PLOT_KEYS
     fig, axes = plt.subplots(
-        len(keys), len(rows), figsize=(4.5 * len(rows), 2.2 * len(keys)), squeeze=False
+        len(keys), len(rows), figsize=(4.5 * len(rows), 2.0 * len(keys)), squeeze=False
     )
     for col, (env_id, hist) in enumerate(rows):
         steps = [h["step"] for h in hist]
         for row, key in enumerate(keys):
             ax = axes[row][col]
+            if key not in hist[0]:
+                ax.set_ylabel(key, fontsize=8)
+                ax.text(0.5, 0.5, "n/a", transform=ax.transAxes, ha="center")
+                continue
             vals = [h[key] for h in hist]
             ax.plot(steps, vals, color=COLOR_META, lw=1.5)
             ax.set_ylabel(key, fontsize=8)
@@ -1063,10 +1157,10 @@ def plot_knob_trajectories_multi_seed(
     if not all_results:
         return
     tasks = list(all_results[0].keys())
-    keys = ["lr_mult", "eps_end", "train_freq", "target_freq"]
+    keys = KNOB_PLOT_KEYS
     seed_cmap = plt.get_cmap("tab10")
     fig, axes = plt.subplots(
-        len(keys), len(tasks), figsize=(4.5 * len(tasks), 2.2 * len(keys)), squeeze=False
+        len(keys), len(tasks), figsize=(4.5 * len(tasks), 2.0 * len(keys)), squeeze=False
     )
 
     for col, env_id in enumerate(tasks):
@@ -1085,7 +1179,12 @@ def plot_knob_trajectories_multi_seed(
         grid = np.linspace(lo, hi, 200)
         for row, key in enumerate(keys):
             ax = axes[row][col]
-            rows = np.vstack([_interp_hist(h, "step", key, grid) for h in hists])
+            usable = [h for h in hists if key in h[0]]
+            if not usable:
+                ax.set_ylabel(key, fontsize=8)
+                ax.text(0.5, 0.5, "n/a", transform=ax.transAxes, ha="center")
+                continue
+            rows = np.vstack([_interp_hist(h, "step", key, grid) for h in usable])
             mu = np.nanmean(rows, axis=0)
             for i, row_vals in enumerate(rows):
                 ax.plot(grid, row_vals, color=seed_cmap(i % 10), alpha=0.35, lw=0.9, zorder=1)
@@ -1149,9 +1248,20 @@ def main() -> None:
         type=int,
         default=None,
         metavar="E",
-        help="stop each eval inner run after E completed episodes (meta-train uses --inner-steps)",
+        help="Stop each inner run (meta-train + eval) after E completed episodes",
+    )
+    p.add_argument(
+        "--tag",
+        type=str,
+        default="",
+        help="Suffix for checkpoints/figures (isolates parallel / resume runs)",
     )
     p.add_argument("--seeds", type=str, default=",".join(map(str, DEFAULT_SEEDS)))
+    p.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore existing controller checkpoints and train from scratch",
+    )
     p.add_argument(
         "--eval-only",
         action="store_true",
@@ -1192,17 +1302,25 @@ def main() -> None:
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    n_seeds_tag = f"{len(seeds)}seeds"
+    run_tag = args.tag
+    tag_sfx = f"_{run_tag}" if run_tag else ""
     budget_tag = (
         f"ep{args.total_episodes}"
         if args.total_episodes is not None
         else f"inner{args.inner_steps}"
     )
+    if run_tag:
+        budget_tag = f"{budget_tag}_{run_tag}"
     all_eval_results: List[Dict[str, Dict[str, Dict]]] = []
 
+    # Episode budget also raises step safety cap for train/eval
+    inner_steps = args.inner_steps
+    if args.total_episodes is not None:
+        inner_steps = max(inner_steps, int(args.total_episodes) * 2000)
+
     for seed in seeds:
-        ckpt_path = CKPT_DIR / f"meta_controller_seed{seed}.pt"
-        eval_path = CKPT_DIR / f"eval_vs_baseline_seed{seed}.pt"
+        ckpt_path = CKPT_DIR / f"meta_controller_seed{seed}{tag_sfx}.pt"
+        eval_path = CKPT_DIR / f"eval_vs_baseline_seed{seed}{tag_sfx}.pt"
 
         controller: Optional[MetaHPOController] = None
         history: List[Dict] = []
@@ -1216,11 +1334,11 @@ def main() -> None:
             if not args.aggregate_only:
                 plot_eval_curves(
                     results,
-                    FIG_DIR / f"meta_vs_baseline_seed{seed}.jpg",
-                    title_suffix=f" (seed={seed})",
+                    FIG_DIR / f"meta_vs_baseline_seed{seed}{tag_sfx}.jpg",
+                    title_suffix=f" (seed={seed}{tag_sfx})",
                 )
                 plot_knob_trajectories(
-                    results, FIG_DIR / f"knob_trajectories_seed{seed}.jpg"
+                    results, FIG_DIR / f"knob_trajectories_seed{seed}{tag_sfx}.jpg"
                 )
                 if ckpt_path.exists():
                     train_blob = torch.load(
@@ -1228,32 +1346,58 @@ def main() -> None:
                     )
                     plot_meta_train_progress(
                         train_blob.get("history", []),
-                        FIG_DIR / f"meta_train_progress_seed{seed}.jpg",
+                        FIG_DIR / f"meta_train_progress_seed{seed}{tag_sfx}.jpg",
                     )
             continue
 
         if not args.eval_only:
             if args.train_missing_only and ckpt_path.exists():
-                print(f"Controller present, skipping meta-train: {ckpt_path}", flush=True)
                 blob = torch.load(ckpt_path, map_location=device, weights_only=False)
-                controller = MetaHPOController(n_tasks=len(blob["tasks"])).to(device)
-                controller.load_state_dict(blob["controller"])
-                history = blob.get("history", [])
-                tasks = blob.get("tasks", tasks)
+                done = int(blob.get("meta_iters_done", len(blob.get("history", []))))
+                if done >= args.meta_iters:
+                    print(
+                        f"Controller complete ({done}/{args.meta_iters}), "
+                        f"skipping meta-train: {ckpt_path}",
+                        flush=True,
+                    )
+                    controller = MetaHPOController(n_tasks=len(blob["tasks"])).to(device)
+                    controller.load_state_dict(blob["controller"])
+                    history = blob.get("history", [])
+                    tasks = blob.get("tasks", tasks)
+                else:
+                    train_out = run_meta_train(
+                        tasks=tasks,
+                        meta_iters=args.meta_iters,
+                        inner_steps=inner_steps,
+                        seed=seed,
+                        device=device,
+                        checkpoint_dir=CKPT_DIR,
+                        total_episodes=args.total_episodes,
+                        tag=run_tag,
+                        resume=not args.no_resume,
+                    )
+                    controller = train_out["controller"]
+                    history = train_out["history"]
+                    plot_meta_train_progress(
+                        history,
+                        FIG_DIR / f"meta_train_progress_seed{seed}{tag_sfx}.jpg",
+                    )
             else:
                 train_out = run_meta_train(
                     tasks=tasks,
                     meta_iters=args.meta_iters,
-                    inner_steps=args.inner_steps,
+                    inner_steps=inner_steps,
                     seed=seed,
                     device=device,
                     checkpoint_dir=CKPT_DIR,
-                    total_episodes=None,
+                    total_episodes=args.total_episodes,
+                    tag=run_tag,
+                    resume=not args.no_resume,
                 )
                 controller = train_out["controller"]
                 history = train_out["history"]
                 plot_meta_train_progress(
-                    history, FIG_DIR / f"meta_train_progress_seed{seed}.jpg"
+                    history, FIG_DIR / f"meta_train_progress_seed{seed}{tag_sfx}.jpg"
                 )
         else:
             if not ckpt_path.exists():
@@ -1278,12 +1422,13 @@ def main() -> None:
         results = run_eval_vs_baseline(
             tasks=tasks,
             controller=controller,
-            inner_steps=args.inner_steps,
+            inner_steps=inner_steps,
             seed=seed,
             device=device,
             checkpoint_dir=CKPT_DIR,
             deterministic_ctrl=True,
             total_episodes=args.total_episodes,
+            tag=run_tag,
         )
         results = _filter_results(results, tasks)
         if not args.aggregate_only:
@@ -1294,11 +1439,11 @@ def main() -> None:
             )
             plot_eval_curves(
                 results,
-                FIG_DIR / f"meta_vs_baseline_seed{seed}.jpg",
-                title_suffix=f" (seed={seed}, {budget_suffix})",
+                FIG_DIR / f"meta_vs_baseline_seed{seed}{tag_sfx}.jpg",
+                title_suffix=f" (seed={seed}, {budget_suffix}{tag_sfx})",
             )
             plot_knob_trajectories(
-                results, FIG_DIR / f"knob_trajectories_seed{seed}.jpg"
+                results, FIG_DIR / f"knob_trajectories_seed{seed}{tag_sfx}.jpg"
             )
         all_eval_results.append(results)
 
