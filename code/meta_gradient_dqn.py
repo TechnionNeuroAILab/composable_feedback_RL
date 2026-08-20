@@ -444,6 +444,7 @@ def run_training(args: Args) -> dict:
     start_time = time.time()
     observation, _ = envs.reset(seed=args.seed)
     episode_returns: list[float] = []
+    controller_history: list[dict] = []
     training_done = False
     for global_step in range(timestep_limit):
         if training_done:
@@ -540,6 +541,18 @@ def run_training(args: Args) -> dict:
                     args.meta_objective_gamma,
                     args.meta_grad_clip,
                 )
+                controller_history.append(
+                    {
+                        "step": global_step,
+                        "gamma": float(meta_parameters.gamma().detach().item()),
+                        "learning_rate": float(
+                            meta_parameters.learning_rate().detach().item()
+                        ),
+                        "meta_loss": meta_loss,
+                        "gamma_grad": gamma_grad,
+                        "learning_rate_grad": lr_grad,
+                    }
+                )
                 if writer is not None:
                     writer.add_scalar(
                         "meta/validation_td_loss", meta_loss, global_step
@@ -618,6 +631,7 @@ def run_training(args: Args) -> dict:
 
     results = {
         "episode_returns": episode_returns,
+        "controller_history": controller_history,
         "meta_gradient": args.meta_gradient,
         "seed": args.seed,
         "env_id": args.env_id,
