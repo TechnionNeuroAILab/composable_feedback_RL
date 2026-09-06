@@ -17,7 +17,20 @@
 !cleanRL_models/**
 !bike_env/
 !bike_env/**
+!hyperparameters_tuning/
+!hyperparameters_tuning/**
 !*.ipynb
+
+# Large / regenerable HPO reproduction artifacts
+hyperparameters_tuning/results/**
+!hyperparameters_tuning/results/.gitkeep
+hyperparameters_tuning/vendor/**
+!hyperparameters_tuning/vendor/README.md
+hyperparameters_tuning/figures/*.jpg
+hyperparameters_tuning/figures/*.png
+hyperparameters_tuning/figures/*.pdf
+!hyperparameters_tuning/figures/.gitkeep
+hyperparameters_tuning/scripts/__pycache__/
 
 # Python
 __pycache__/

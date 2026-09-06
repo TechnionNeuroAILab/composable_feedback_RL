@@ -25,6 +25,11 @@ dependencies:
       - tenacity>=8.2.2
       - tyro>=0.5.10
 
+      # CartPole hyperparameter optimization
+      - optuna>=4.9
+      - ray[tune]>=2.57
+      - GPy>=1.14
+
       # Optional extras (install as needed):
       # - Atari:      pip install ".[atari]"      (or use cleanrl/requirements/requirements-atari.txt)
       # - MuJoCo:     pip install ".[mujoco]"

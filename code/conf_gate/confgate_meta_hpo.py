@@ -216,8 +216,15 @@ class QNetwork(nn.Module):
 class DQNAgent:
     """Fresh Q-network + target + Adam; accepts live hparams each step."""
 
-    def __init__(self, obs_dim: int, n_actions: int, device: torch.device):
+    def __init__(
+        self,
+        obs_dim: int,
+        n_actions: int,
+        device: torch.device,
+        gamma: float = GAMMA,
+    ):
         self.device = device
+        self.gamma = float(gamma)
         self.q_net = QNetwork(obs_dim, n_actions).to(device)
         self.t_net = QNetwork(obs_dim, n_actions).to(device)
         self.t_net.load_state_dict(self.q_net.state_dict())
@@ -241,7 +248,10 @@ class DQNAgent:
     def td_update(self, batch: ReplaySamples) -> float:
         with torch.no_grad():
             next_q = self.t_net(batch.next_observations).max(dim=1).values
-            y = batch.rewards.flatten() + GAMMA * (1.0 - batch.dones.flatten()) * next_q
+            y = (
+                batch.rewards.flatten()
+                + self.gamma * (1.0 - batch.dones.flatten()) * next_q
+            )
         q_sa = self.q_net(batch.observations).gather(1, batch.actions).squeeze(1)
         loss = F.mse_loss(q_sa, y)
         self.opt.zero_grad()
