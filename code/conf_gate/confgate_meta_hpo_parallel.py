@@ -41,7 +41,7 @@ from typing import Dict, List, Optional, Sequence
 ROOT = Path(__file__).resolve().parent.parent
 WORKER = Path(__file__).resolve().parent / "confgate_meta_hpo.py"
 CKPT_DIR = ROOT / "paper" / "_tmp_b_feedb_cg" / "ckpt_meta_hpo"
-FIG_DIR = ROOT / "paper" / "figures" / "conf_meta_hpo"
+FIG_DIR = ROOT / "paper" / "figures" / "conf_meta_hpo_v2"
 RUNS_DIR = CKPT_DIR / "parallel_runs"
 
 
@@ -113,8 +113,6 @@ def _build_worker_cmd(
         str(args.meta_iters),
         "--inner-steps",
         str(args.inner_steps),
-        "--total-episodes",
-        str(args.total_episodes),
         "--seeds",
         str(seed),
         "--tag",
@@ -122,6 +120,8 @@ def _build_worker_cmd(
         "--train-missing-only",
         "--aggregate-only",
     ]
+    if args.total_episodes is not None:
+        cmd.extend(["--total-episodes", str(args.total_episodes)])
     if args.skip_eval:
         cmd.append("--skip-eval")
     if args.no_resume:
@@ -265,8 +265,6 @@ def _aggregate(args: argparse.Namespace, seeds: Sequence[int]) -> None:
         "--aggregate-only",
         "--tasks",
         args.tasks,
-        "--total-episodes",
-        str(args.total_episodes),
         "--inner-steps",
         str(args.inner_steps),
         "--seeds",
@@ -274,6 +272,8 @@ def _aggregate(args: argparse.Namespace, seeds: Sequence[int]) -> None:
         "--tag",
         args.tag,
     ]
+    if args.total_episodes is not None:
+        cmd.extend(["--total-episodes", str(args.total_episodes)])
     print(f"[launcher] aggregate: {' '.join(cmd)}", flush=True)
     subprocess.check_call(cmd, cwd=str(ROOT))
 
@@ -282,7 +282,13 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--tasks", type=str, default="CartPole-v1")
     p.add_argument("--meta-iters", type=int, default=20)
-    p.add_argument("--total-episodes", type=int, default=1000)
+    p.add_argument(
+        "--total-episodes",
+        type=int,
+        default=None,
+        metavar="E",
+        help="Optional episode cap per inner run (omit to use --inner-steps only)",
+    )
     p.add_argument(
         "--inner-steps",
         type=int,
@@ -342,7 +348,11 @@ def main() -> None:
     print(f"  tag         : {args.tag}", flush=True)
     print(f"  tasks       : {args.tasks}", flush=True)
     print(f"  meta_iters  : {args.meta_iters}", flush=True)
-    print(f"  episodes    : {args.total_episodes}", flush=True)
+    print(f"  inner_steps : {args.inner_steps}", flush=True)
+    print(
+        f"  episodes    : {args.total_episodes if args.total_episodes is not None else '(none — step budget)'}",
+        flush=True,
+    )
     print(f"  seeds       : {seeds}", flush=True)
     print(f"  workers     : {workers}", flush=True)
     print(f"  gpus        : {gpus}", flush=True)

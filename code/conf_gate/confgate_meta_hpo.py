@@ -44,7 +44,7 @@ from torch.distributions import Categorical
 # ---------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent.parent
 CKPT_DIR = ROOT / "paper" / "_tmp_b_feedb_cg" / "ckpt_meta_hpo"
-FIG_DIR = ROOT / "paper" / "figures" / "conf_meta_hpo"
+FIG_DIR = ROOT / "paper" / "figures" / "conf_meta_hpo_v2"
 
 # ---------------------------------------------------------------------------
 # Hyper-parameters (CleanRL-style defaults)
