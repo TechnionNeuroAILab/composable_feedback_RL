@@ -1,0 +1,93 @@
+#######################################
+###  SEARL TD3 HalfCheetah SMOKE    ###
+###  Tiny budget for pipeline check ###
+#######################################
+expt:
+  project_name:                 "searl"
+  session_name:                 "neuroevolution"
+  experiment_name:              "halfcheetah_td3_smoke"
+
+
+nevo:
+  population_size:              2
+  tournament_size:              2
+  selection:                    True
+  mutation:                     True
+  training:                     True
+  elitism:                      True
+  min_train_time:               50
+  worker:                       2
+  reuse_batch:                  1
+  ind_memory:                   False
+  init_random:                  False
+
+
+mutation:
+  no_mutation:                  0.2
+  parameters:                   0.2
+  architecture:                 0.2
+  activation:                   0.2
+  rl_hyperparam:                0.2
+  rl_hp_selection:              ['lr_actor','lr_critic']
+  new_layer_prob:               0.2
+  mutation_sd:                  0.1
+
+
+train:
+  replay_memory_size:           100000
+  num_frames:                   5000
+  td3_double_q:                 True
+  evo_warm_up:                  1
+  min_train_steps:              50
+
+
+rl:
+  train_frames_fraction:        0.5
+  gamma:                        0.99
+  tau:                          0.005
+  batch_size:                   64
+  lr_actor:                     0.001
+  lr_critic:                    0.001
+  clip_grad_norm:               100
+  td3_policy_noise:             0.2
+  td3_noise_clip:               0.5
+  td3_update_freq:              2
+  optimizer:                    "adam"
+  start_timesteps:              1
+
+
+seed:
+  replay_memory:                123
+  evaluation:                   123
+  mutation:                     123
+  training:                     123
+  torch:                        123
+  numpy:                        123
+
+
+# Smoke only: HalfCheetah-v4 for modern mujoco. Paper runs use HalfCheetah-v2.
+env:
+  name:                        'HalfCheetah-v4'
+
+
+eval:
+  eval_episodes:                1
+  min_eval_steps:               50
+  exploration_noise:            0.1
+  test_episodes:                2
+  test_seed:                    123
+
+
+actor:
+  hidden_size:             [64]
+  activation:              'relu'
+  output_activation:       'tanh'
+  layer_norm:              True
+  output_vanish:           False
+
+critic:
+  hidden_size:             [64]
+  activation:              'relu'
+  output_activation:       'linear'
+  layer_norm:              True
+  output_vanish:           True
