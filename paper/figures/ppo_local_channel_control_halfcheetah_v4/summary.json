@@ -1,0 +1,42 @@
+{
+  "best_mean_return_last_100": 3614.6466566315808,
+  "env_id": "HalfCheetah-v4",
+  "final_alpha_specific": [
+    0.05,
+    0.05,
+    0.05,
+    0.05
+  ],
+  "final_critic_lr": [
+    0.003,
+    0.003,
+    0.003,
+    0.003
+  ],
+  "final_gae_lambda": [
+    0.99,
+    0.99,
+    0.99,
+    0.99
+  ],
+  "final_gamma": [
+    0.9,
+    0.9383737857555307,
+    0.9733424482690793,
+    0.999
+  ],
+  "final_gate": [
+    0.05,
+    0.05,
+    1.0,
+    0.05
+  ],
+  "final_mean_return_last_100": 3460.841996257942,
+  "num_channels": 4,
+  "num_episodes": 5001,
+  "num_modules": 4,
+  "num_windows": 2442,
+  "routing_mode": "backprop",
+  "seed": 1,
+  "total_env_steps": 5001216
+}
