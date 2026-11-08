@@ -1,0 +1,15 @@
+\begin{tabular}{lrr}
+\toprule
+Variant & CartPole-v1 & HalfCheetah-v4 \\
+\midrule
+SEARL DQN & 167 $\pm$ 88 (10) & 794 $\pm$ 823 (10) \\
+SEARL + 2 heads (lr gate) & 166 $\pm$ 59 (10) & 1694 $\pm$ 946 (10) \\
+SEARL + per-obs heads (lr gate) & 194 $\pm$ 44 (3) & 1766 $\pm$ 447 (3) \\
+\midrule
+CleanRL DQN & 453 $\pm$ 35 (10) & 1673 $\pm$ 539 (3) \\
+DQN + 2 heads (lr gate) & 465 $\pm$ 53 (10) & 1159 $\pm$ 334 (3) \\
+DQN + per-obs heads (lr gate) & 475 $\pm$ 9 (3) & 1820 $\pm$ 264 (3) \\
+\midrule
+Rainbow & 487 $\pm$ 12 (10) & 1942 $\pm$ 347 (3) \\
+\bottomrule
+\end{tabular}

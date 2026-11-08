@@ -1,0 +1,21 @@
+\begin{tabular}{llrr}
+\toprule
+Family & Variant & CartPole-v1 & HalfCheetah-v4 \\
+\midrule
+SEARL & no heads (SEARL DQN) & 169 $\pm$ 55 (3) & 882 $\pm$ 939 (3) \\
+SEARL & 2 heads, lr gate only & 169 $\pm$ 75 (3) & 1718 $\pm$ 746 (3) \\
+SEARL & 2 heads, heads act (mix only) & 167 $\pm$ 138 (3) & 586 $\pm$ 1110 (3) \\
+SEARL & 2 heads, heads act + lr gate & 194 $\pm$ 48 (3) & 1743 $\pm$ 1484 (3) \\
+SEARL & per-obs heads, lr gate only & 194 $\pm$ 44 (3) & 1766 $\pm$ 447 (3) \\
+SEARL & per-obs heads, heads act (mix only) & 276 $\pm$ 79 (3) & 1393 $\pm$ 1045 (3) \\
+SEARL & per-obs heads, heads act + lr gate & 109 $\pm$ 11 (3) & 425 $\pm$ 1102 (3) \\
+\midrule
+single-agent DQN & no heads (CleanRL DQN) & 454 $\pm$ 17 (3) & 1673 $\pm$ 539 (3) \\
+single-agent DQN & 2 heads, lr gate only & 435 $\pm$ 86 (3) & 1159 $\pm$ 334 (3) \\
+single-agent DQN & 2 heads, heads act (mix only) & 305 $\pm$ 50 (3) & 847 $\pm$ 121 (3) \\
+single-agent DQN & 2 heads, heads act + lr gate & 316 $\pm$ 61 (3) & 952 $\pm$ 232 (3) \\
+single-agent DQN & per-obs heads, lr gate only & 475 $\pm$ 9 (3) & 1820 $\pm$ 264 (3) \\
+single-agent DQN & per-obs heads, heads act (mix only) & 297 $\pm$ 122 (3) & 647 $\pm$ 187 (3) \\
+single-agent DQN & per-obs heads, heads act + lr gate & 397 $\pm$ 101 (3) & 544 $\pm$ 285 (3) \\
+\bottomrule
+\end{tabular}

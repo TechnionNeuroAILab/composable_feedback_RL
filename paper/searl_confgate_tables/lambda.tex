@@ -1,0 +1,14 @@
+\begin{tabular}{llrrl}
+\toprule
+Task & Variant & $\lambda$ first 10\% & $\lambda$ last 10\% & final $\lambda$ per seed \\
+\midrule
+CartPole-v1 & 2 heads, heads act (mix only) & 0.10 & 0.51 & 0.65, 0.12, 0.75 \\
+CartPole-v1 & 2 heads, heads act + lr gate & 0.24 & 0.12 & 0.02, 0.00, 0.33 \\
+CartPole-v1 & per-obs, heads act (mix only) & 0.13 & 0.47 & 0.23, 0.71, 0.48 \\
+CartPole-v1 & per-obs, heads act + lr gate & 0.11 & 0.41 & 0.51, 0.47, 0.25 \\
+HalfCheetah-v4 & 2 heads, heads act (mix only) & 0.17 & 0.19 & 0.05, 0.45, 0.08 \\
+HalfCheetah-v4 & 2 heads, heads act + lr gate & 0.22 & 0.01 & 0.01, 0.01, 0.02 \\
+HalfCheetah-v4 & per-obs, heads act (mix only) & 0.23 & 0.07 & 0.13, 0.09, 0.00 \\
+HalfCheetah-v4 & per-obs, heads act + lr gate & 0.21 & 0.23 & 0.00, 0.56, 0.14 \\
+\bottomrule
+\end{tabular}
