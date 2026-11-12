@@ -133,6 +133,7 @@ class LRController:
 
 
 # ---- ConfGate-mix: the heads take part in acting. Q_mix = (1 - lam) Q_full + lam * mean_k Q_k(group-k view)
+NEUTRAL_LAM = False   # control: lam is carried and mutated but never used to act, so selection cannot see it
 _REG = {}   # id(actor) -> individual, refreshed every training phase (every individual is trained before it is evaluated)
 
 
@@ -146,7 +147,7 @@ def policy_q(net, x):
     """Q-values used to act. Plain net(x) unless the individual has lam > 0 (then no extra random draws, no grad)."""
     q = net(x)
     indi = _REG.get(id(net))
-    if indi is None or indi.controller is None or indi.controller.lam <= 0 or indi.heads.feature_dim != net.hidden_size[-1]:
+    if NEUTRAL_LAM or indi is None or indi.controller is None or indi.controller.lam <= 0 or indi.heads.feature_dim != net.hidden_size[-1]:
         return q
     heads = indi.heads
     qh = torch.stack([heads.heads[g](trunk_features(net, heads.mask(x, g))) for g in range(len(heads.heads))]).mean(0)
@@ -289,7 +290,10 @@ def train_mlp_cg(indi, replay, iterations, device):
 
 
 def run(env_id, seed, pop, frames, controller=True, mutations="full", heads="groups", log=print, task="gym", lanes=5,
-        solutions=8, eval_episodes=3, eval_seed0=None, eval_every_frames=None, mix=False, lam_init=0.2, lam_mutable=True):
+        solutions=8, eval_episodes=3, eval_seed0=None, eval_every_frames=None, mix=False, lam_init=0.2, lam_mutable=True,
+        neutral_lam=False):
+    global NEUTRAL_LAM
+    NEUTRAL_LAM = bool(neutral_lam)
     import fastrand
     assert not (mix and task == "bike"), "ConfGate-mix is implemented for the gym tasks (CartPole / HalfCheetah) only"
     seed_confgate(seed)
@@ -357,6 +361,7 @@ def main():
     p.add_argument("--mix", action="store_true", help="ConfGate-mix: the heads also take part in acting (Q_mix = (1-lam) Q_full + lam mean_k Q_k)")
     p.add_argument("--lam-init", type=float, default=0.2)
     p.add_argument("--fixed-lam", action="store_true", help="do not let SEARL mutate lam (control runs)")
+    p.add_argument("--neutral-lam", action="store_true", help="control: lam mutates and is inherited but is not used to act (selection blind to it)")
     p.add_argument("--mutations", choices=["full", "lr_only"], default="full")
     p.add_argument("--heads", choices=["groups", "per_obs"], default="groups",
                    help="groups: two heads on observation groups; per_obs: one head per observation entry")
@@ -365,7 +370,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     hist, cglog = run(a.env, a.seed, a.pop, a.frames, controller=not a.no_controller, mutations=a.mutations, heads=a.heads, task=a.task,
                       lanes=a.lanes, solutions=a.solutions, eval_episodes=a.eval_episodes, eval_seed0=a.eval_seed0,
-                      eval_every_frames=a.eval_every_frames, mix=a.mix, lam_init=a.lam_init, lam_mutable=not a.fixed_lam,
+                      eval_every_frames=a.eval_every_frames, mix=a.mix, lam_init=a.lam_init, lam_mutable=not a.fixed_lam, neutral_lam=a.neutral_lam,
                       log=lambda m: print(m, flush=True))
     h = pd.DataFrame(hist)
     h.to_csv(os.path.join(a.out, "history.csv"), index=False)
