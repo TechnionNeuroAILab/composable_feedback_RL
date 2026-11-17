@@ -48,6 +48,7 @@ parser.add_argument('--norm-clip', type=float, default=10, metavar='NORM', help=
 parser.add_argument('--learn-start', type=int, default=int(20e3), metavar='STEPS', help='Number of steps before starting training')
 parser.add_argument('--lanes', type=int, default=5, help='bike grid: lanes of bike_v2.1')
 parser.add_argument('--solutions', type=int, default=8, help='bike grid: solutions of bike_v2.1')
+parser.add_argument('--joint-actions', action='store_true', help='bike v3.0: one action over the 9 joint (steer, throttle) pairs = the original single-branch network (default: 2 independent branches)')
 parser.add_argument('--eval-every', type=int, default=0, help='bike grid: if > 0, greedy evaluation every EVAL_EVERY steps')
 parser.add_argument('--eval-episodes', type=int, default=10)
 parser.add_argument('--eval-seed0', type=int, default=5000)
@@ -71,7 +72,7 @@ if args.task == 'atari':
   mem_kwargs = dict(state_shape=(84, 84), state_dtype=np.uint8, branches=1)
 else:
   from env_tasks import GymTask
-  env = GymTask(args.env, args.seed, args.reward_scale, args.obs_scale, args.lanes, args.solutions)
+  env = GymTask(args.env, args.seed, args.reward_scale, args.obs_scale, args.lanes, args.solutions, args.joint_actions)
   args.history_length, args.architecture, args.reward_clip = 1, 'mlp', 0
   action_space, branches, obs_dim = env.n_actions, env.branches, env.obs_dim
   mem_kwargs = dict(state_shape=(obs_dim,), state_dtype=np.float32, branches=branches)
@@ -134,7 +135,9 @@ for T in range(1, args.T_max + 1):
     from common_bike import greedy_return
     dqn.eval()
     eval_file.write('%d,%s\n' % (T, greedy_return(lambda o: dqn.act(torch.tensor(np.asarray(o, np.float32).reshape(-1) * args.obs_scale)),
-                                                   args.lanes, args.solutions, args.eval_episodes, args.eval_seed0)))
+                                                   args.lanes, args.solutions, args.eval_episodes, args.eval_seed0,
+                                                   args.env.split('_L')[-1] if args.env.startswith('bike3_L') else None,
+                                                   joint=args.joint_actions)))
     dqn.train()
 
   if T % 20000 == 0:
