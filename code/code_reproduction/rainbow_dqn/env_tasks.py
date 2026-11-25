@@ -13,8 +13,13 @@ sys.path.insert(0, os.path.join(HERE, "..", "multi_benchmark"))
 
 
 class GymTask:
-  def __init__(self, env_id, seed, reward_scale=1.0, obs_scale=1.0, lanes=5, solutions=8):
-    if env_id == "bike":
+  def __init__(self, env_id, seed, reward_scale=1.0, obs_scale=1.0, lanes=5, solutions=8, joint=False):
+    if env_id.startswith("bike3_L"):   # bike v3.0 at level 1/2/4.1, action = (steer, throttle) = 2 branches, or with
+      # joint=True one Discrete(9) action (a = 3 * steer + throttle) = 1 branch, the original Rainbow network
+      from common_bike import make_bike3_env
+      env = make_bike3_env(seed, level=env_id.split("_L")[-1], reward_scale=1.0, lanes=lanes, solutions=solutions,
+                           joint=joint)
+    elif env_id == "bike":
       from common_bike import make_bike_env
       env = make_bike_env(seed, reward_scale=1.0, lanes=lanes, solutions=solutions)   # raw rewards; scaling is applied here
     else:

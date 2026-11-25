@@ -82,16 +82,24 @@ class Args:
     eval_seed0: int = 5000
     eval_csv: str = ""
     """[bike grid] where to write global_step, greedy_return"""
+    joint_actions: bool = False
+    """[bike v3.0] vanilla DQN: one Q-head over the 9 joint (steer, throttle) actions instead of two independent heads"""
+    lookahead: int = 0
+    """[bike v3.0] if > 0: append the hole grid of the next `lookahead` rows to the observation"""
 
 
-BIKE_KW = {"lanes": 5, "solutions": 8}  # [bike grid] set from the CLI before the envs are built
+BIKE_KW = {"lanes": 5, "solutions": 8, "joint": False, "lookahead": 0}  # [bike grid] set from the CLI before the envs are built
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         # [changed for this reproduction] bike v2.1 instead of gym.make(env_id); common_bike adds
         # RecordEpisodeStatistics (raw return) and the shared reward/20 scaling
-        if env_id == "bike_v2.1":
+        if env_id.startswith("bike_v3.0_L"):   # [bike v3.0] level 1/2/4.1, action = (steer, throttle)
+            from common_bike import make_bike3_env
+            env = make_bike3_env(seed * 100 + idx, level=env_id.split("_L")[-1], lanes=BIKE_KW["lanes"], solutions=BIKE_KW["solutions"],
+                                 joint=BIKE_KW["joint"], lookahead=BIKE_KW["lookahead"])
+        elif env_id == "bike_v2.1":
             from common_bike import make_bike_env
             env = make_bike_env(seed * 100 + idx, lanes=BIKE_KW["lanes"], solutions=BIKE_KW["solutions"])
         else:   # any gymnasium discrete env (e.g. CartPole-v1): CleanRL's own env construction
@@ -174,7 +182,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    BIKE_KW.update(lanes=args.lanes, solutions=args.solutions)
+    BIKE_KW.update(lanes=args.lanes, solutions=args.solutions, joint=args.joint_actions, lookahead=args.lookahead)
     eval_file = None
     if args.eval_every > 0 and args.eval_csv:
         eval_file = open(args.eval_csv, "w", buffering=1)
@@ -212,9 +220,11 @@ if __name__ == "__main__":
 
             def _greedy(o):
                 with torch.no_grad():
-                    return int(torch.argmax(q_network(torch.as_tensor(o, dtype=torch.float32, device=device)[None]), dim=1))
+                    q = q_network(torch.as_tensor(o, dtype=torch.float32, device=device)[None])
+                    return _branch(q, n_joints).argmax(-1)[0].cpu().numpy() if factored else int(torch.argmax(q, dim=1))
 
-            eval_file.write(f"{global_step},{greedy_return(_greedy, args.lanes, args.solutions, args.eval_episodes, args.eval_seed0)}\n")
+            level = args.env_id.split("_L")[-1] if args.env_id.startswith("bike_v3.0_L") else None
+            eval_file.write(f"{global_step},{greedy_return(_greedy, args.lanes, args.solutions, args.eval_episodes, args.eval_seed0, level, args.joint_actions, args.lookahead)}\n")
 
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)

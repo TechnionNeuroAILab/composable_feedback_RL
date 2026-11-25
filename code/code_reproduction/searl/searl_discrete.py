@@ -14,6 +14,10 @@ operators, no multiprocessing):
                 clipped rewards -- exactly the original wrap_deepmind(frame_stack=False) pipeline, rebuilt on
                 gymnasium (the original needs the unbuildable gym 0.17.1/atari-py stack). Fitness = greedy return of
                 one episode (noisy nets in eval mode), transitions of every evaluation go to the shared replay.
+  --task bike3 (bike v3.0, --env L1 / L2 / L4.1: route / + speed / route + balance (free speed, no speed limits, kick(5)=2); action = (steer, throttle)): as --task bike.
+                --joint-actions: one Discrete(9) action a = 3 * steer + throttle, so the Q-network has ONE head over
+                the 9 joint actions and the run is exactly the --task bike (v2.1) code path with 9 instead of 3
+                actions (default: two independent heads of 3, averaged).
   --task gym   (small gymnasium discrete tasks, e.g. CartPole-v1): identical to --task bike (MLP path), reward unscaled.
   --task bike  (bike_env v2.1, 8-number observation): same loop with an MLP Q-network (evolvable_mlp.py), the
                 port's mutation operators pointed at that network, a standard double-DQN update (Huber loss, soft
@@ -78,7 +82,7 @@ def make_atari_env(env_id):
     return ChannelFirst(env)
 
 
-def make_env(task, env_id, seed, lanes=5, solutions=8):
+def make_env(task, env_id, seed, lanes=5, solutions=8, joint=False):
     if task == "atari":
         sys.path.insert(0, os.path.join(HERE, "..", "multi_benchmark"))
         return make_atari_env(env_id)
@@ -91,6 +95,9 @@ def make_env(task, env_id, seed, lanes=5, solutions=8):
             pass
         from discrete_halfcheetah import prepare_env
         return prepare_env(gym.make(env_id), env_id)
+    if task == "bike3":   # bike v3.0; env_id = level "L1" / "L2" / "L4.1"; joint: one Discrete(9) action
+        from common_bike import make_bike3_env
+        return make_bike3_env(seed * 100, level=str(env_id), reward_scale=1.0, lanes=lanes, solutions=solutions, joint=joint)
     from common_bike import make_bike_env
     return make_bike_env(seed * 100, reward_scale=1.0, lanes=lanes, solutions=solutions)
 
@@ -266,6 +273,11 @@ def run_episode(task, env, net, seed, device, epsilon, replay=None, random_actio
 
 
 # ---------------------------------------------------------------------------------------------------- SEARL
+def greedy_q(net, x):
+    """Q-values the shared greedy evaluation acts on (searl_discrete_loops.py overrides it with the sum of the loops)."""
+    return net(x)
+
+
 def make_cfg(task, seed, pop, frames):
     d = {
         "nevo": {"population_size": pop, "tournament_size": 3, "elitism": True},
@@ -291,14 +303,15 @@ def make_cfg(task, seed, pop, frames):
     return make_config(d)
 
 
-def run_searl_discrete(task, env_id, seed, pop, frames, log=print, lanes=5, solutions=8, eval_episodes=3, eval_seed0=None, eval_every_frames=None):
+def run_searl_discrete(task, env_id, seed, pop, frames, log=print, lanes=5, solutions=8, eval_episodes=3, eval_seed0=None, eval_every_frames=None,
+                       joint=False):
     cfg = make_cfg(task, seed, pop, frames)
     np.random.seed(seed)
     torch.manual_seed(seed)
     rng = np.random.RandomState(seed)
     device = torch.device("cuda" if torch.cuda.is_available() and task == "atari" else "cpu")
-    env = make_env(task, env_id, seed, lanes, solutions)
-    test_env = make_env(task, env_id, seed + 1000, lanes, solutions) if task != "atari" else None
+    env = make_env(task, env_id, seed, lanes, solutions, joint=joint)
+    test_env = make_env(task, env_id, seed + 1000, lanes, solutions, joint=joint) if task != "atari" else None
     factored = isinstance(env.action_space, gym.spaces.MultiDiscrete)
     n_actions = int(env.action_space.nvec.sum()) if factored else env.action_space.n
     obs_shape = env.observation_space.shape
@@ -306,7 +319,7 @@ def run_searl_discrete(task, env_id, seed, pop, frames, log=print, lanes=5, solu
     replay = ArrayReplay(frames, obs_shape, np.uint8 if task == "atari" else np.float32, action_shape)
     tournament = TournamentSelection(cfg)
     mutation = (CnnMutations if task == "atari" else MlpDqnMutations)(cfg)
-    reward_scale = 1.0 / 20.0 if task == "bike" else 1.0      # bike: shared reward/20 preprocessing
+    reward_scale = 1.0 / 20.0 if task in ("bike", "bike3") else 1.0      # bike: shared reward/20 preprocessing
 
     def new_actor():
         ac = copy.deepcopy(cfg.actor.get_dict)
@@ -346,7 +359,7 @@ def run_searl_discrete(task, env_id, seed, pop, frames, log=print, lanes=5, solu
         best = int(np.argmax(fit))
         rec = {"epoch": epoch, "num_frames": num_frames, "mean_fitness": float(fit.mean()),
                "best_fitness": float(fit[best]), "best_lr": population[best].rl_config.lr_actor}
-        if task == "bike" and eval_seed0 is not None and eval_every_frames:
+        if task in ("bike", "bike3") and eval_seed0 is not None and eval_every_frames:
             # shared bike-grid protocol: evaluate the best individual only when num_frames passes the next multiple of
             # eval_every_frames (the same spacing as the single-agent runs); other epochs log NaN
             due = num_frames // eval_every_frames > last_eval_bucket
@@ -360,14 +373,16 @@ def run_searl_discrete(task, env_id, seed, pop, frames, log=print, lanes=5, solu
             # (the same boards at every epoch and for every method, see common_bike.greedy_return)
             seeds = ([900_000 + epoch * 10 + k for k in range(3)] if eval_seed0 is None
                      else [eval_seed0 + k for k in range(eval_episodes)])
-            if task == "bike" and eval_seed0 is not None:
+            if task in ("bike", "bike3") and eval_seed0 is not None:
                 from common_bike import greedy_return   # the one evaluation function every method uses
 
                 def _greedy(o):
                     with torch.no_grad():
-                        return int(net(torch.from_numpy(np.asarray(o, np.float32))[None]).argmax(1).item())
+                        q = greedy_q(net, torch.from_numpy(np.asarray(o, np.float32))[None])
+                        return q.view(-1, 3).argmax(1).numpy() if factored else int(q.argmax(1).item())
 
-                rec["test_return"] = greedy_return(_greedy, lanes, solutions, eval_episodes, eval_seed0)
+                level = str(env_id) if task == "bike3" else None
+                rec["test_return"] = greedy_return(_greedy, lanes, solutions, eval_episodes, eval_seed0, level, joint=joint)
             else:
                 rec["test_return"] = float(np.mean([run_episode(task, test_env, net, sd_, device, 0.0)[0] for sd_ in seeds]))
         rec["time"] = time.time() - t0
@@ -388,7 +403,7 @@ def run_searl_discrete(task, env_id, seed, pop, frames, log=print, lanes=5, solu
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--task", choices=["atari", "bike", "gym"], required=True)
+    p.add_argument("--task", choices=["atari", "bike", "bike3", "gym"], required=True)
     p.add_argument("--env", default="PongNoFrameskip-v4")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--pop", type=int, default=4)
@@ -399,12 +414,17 @@ def main():
     p.add_argument("--eval-every-frames", type=int, default=None, help="bike + eval-seed0: evaluate about every this many frames")
     p.add_argument("--frames", type=int, default=60_000)
     p.add_argument("--out", required=True)
+    p.add_argument("--joint-actions", action="store_true", help="bike3: one Q-head over the 9 joint (steer, throttle) actions")
     a = p.parse_args()
     os.makedirs(a.out, exist_ok=True)
     hist = run_searl_discrete(a.task, a.env, a.seed, a.pop, a.frames, log=lambda m: print(m, flush=True), lanes=a.lanes,
                               solutions=a.solutions, eval_episodes=a.eval_episodes, eval_seed0=a.eval_seed0,
-                              eval_every_frames=a.eval_every_frames)
-    pd.DataFrame(hist).to_csv(os.path.join(a.out, "history.csv"), index=False)
+                              eval_every_frames=a.eval_every_frames, joint=a.joint_actions)
+    h = pd.DataFrame(hist)
+    h.to_csv(os.path.join(a.out, "history.csv"), index=False)
+    if "test_return" in h:   # shared format: one greedy-return curve per run (epochs without an evaluation hold NaN)
+        h[["num_frames", "test_return"]].dropna().rename(columns={"num_frames": "global_step", "test_return": "greedy_return"}).to_csv(
+            os.path.join(a.out, "eval.csv"), index=False)
     print("wrote", os.path.join(a.out, "history.csv"))
 
 
